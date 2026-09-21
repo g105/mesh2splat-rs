@@ -3,3 +3,4 @@
 *.png
 assets/*.glb
 assets/*.gltf
+.DS_Store

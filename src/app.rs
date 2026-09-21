@@ -111,6 +111,15 @@ enum GizmoTarget {
     Light,
 }
 
+/// Viewport navigation scheme.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CameraControls {
+    /// Original Mesh2Splat fly camera (RMB look + WASD).
+    Fly,
+    /// Maya: Alt+LMB tumble, Alt+MMB (or Alt+Cmd+LMB) pan, Alt+RMB / wheel / pinch dolly, F frame.
+    Maya,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GizmoOp {
     Translate,
@@ -151,6 +160,7 @@ pub struct App {
     output_texture: Option<(egui::TextureId, (u32, u32))>,
 
     camera: Camera,
+    camera_controls: CameraControls,
     settings: RenderSettings,
     quality: f32,
     max_res: u32,
@@ -214,6 +224,7 @@ impl App {
             loaded_path: None,
             output_texture: None,
             camera: Camera::default(),
+            camera_controls: CameraControls::Fly,
             settings: RenderSettings::default(),
             quality: 0.5,
             max_res: 1024,
@@ -657,6 +668,17 @@ impl App {
                 }
             });
 
+            egui::CollapsingHeader::new("Camera").default_open(false).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Controls:");
+                    ui.radio_value(&mut self.camera_controls, CameraControls::Fly, "Fly");
+                    ui.radio_value(&mut self.camera_controls, CameraControls::Maya, "Maya");
+                });
+                if ui.button("Frame model (F)").clicked() {
+                    self.focus_model();
+                }
+            });
+
             egui::CollapsingHeader::new("Gizmo").default_open(false).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut self.gizmo_op, GizmoOp::Translate, "Translate");
@@ -680,10 +702,7 @@ impl App {
                         self.settings.model_transform = Mat4::IDENTITY;
                     }
                     if ui.button("Frame camera").clicked() {
-                        let t = self.settings.model_transform;
-                        let b = self.scene_bbox;
-                        let (mn, mx) = (t.transform_point3(b.min), t.transform_point3(b.max));
-                        self.camera.frame_bbox(&BBox { min: mn.min(mx), max: mn.max(mx) });
+                        self.camera.frame_bbox(&self.model_bbox());
                     }
                 });
             });
@@ -693,7 +712,10 @@ impl App {
             egui::CollapsingHeader::new("Stats").default_open(true).show(ui, |ui| self.stats_ui(ui));
 
             ui.separator();
-            ui.small("Camera: RMB drag to look, WASD move, Q/E down/up, R/T roll, Shift fast, Ctrl slow, wheel zoom.");
+            ui.small(match self.camera_controls {
+                CameraControls::Fly => "Camera: RMB drag to look, WASD move, Q/E down/up, R/T roll, Shift fast, Ctrl slow, wheel zoom, F frame.",
+                CameraControls::Maya => "Camera: Alt+LMB tumble, Alt+MMB or Alt+Cmd+LMB pan, Alt+RMB / wheel / pinch dolly, F frame.",
+            });
         });
     }
 
@@ -832,8 +854,59 @@ impl App {
         ui.add(egui::Slider::new(&mut self.plot_target_ms, 8.3..=50.0).text("Target line (ms)"));
     }
 
+    /// World-space bounds of the model with its gizmo transform applied.
+    fn model_bbox(&self) -> BBox {
+        let t = self.settings.model_transform;
+        let b = self.scene_bbox;
+        let (mn, mx) = (t.transform_point3(b.min), t.transform_point3(b.max));
+        BBox { min: mn.min(mx), max: mn.max(mx) }
+    }
+
+    /// Frame the model, keeping the current view direction (Maya `F`).
+    fn focus_model(&mut self) {
+        self.camera.focus_bbox(&self.model_bbox());
+    }
+
+    /// Wheel notches, like GLFW's scroll callback in the original.
+    fn wheel_notches(ui: &egui::Ui) -> f32 {
+        ui.input(|i| {
+            i.raw
+                .events
+                .iter()
+                .map(|e| match e {
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta,
+                        ..
+                    } => delta.y,
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta,
+                        ..
+                    } => delta.y / 40.0,
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Page,
+                        delta,
+                        ..
+                    } => delta.y * 10.0,
+                    _ => 0.0,
+                })
+                .sum()
+        })
+    }
+
     fn camera_input(&mut self, ui: &egui::Ui, response: &egui::Response, dt: f32) {
         let wants_kb = ui.ctx().egui_wants_keyboard_input();
+        if !wants_kb && response.hovered() && ui.input(|i| i.key_pressed(egui::Key::F)) {
+            self.focus_model();
+        }
+        match self.camera_controls {
+            CameraControls::Fly => self.fly_input(ui, response, dt, wants_kb),
+            CameraControls::Maya => self.maya_input(ui, response),
+        }
+    }
+
+    fn fly_input(&mut self, ui: &egui::Ui, response: &egui::Response, dt: f32, wants_kb: bool) {
         if !wants_kb {
             let keys = ui.input(|i| CameraKeys {
                 forward: i.key_down(egui::Key::W),
@@ -854,33 +927,38 @@ impl App {
             self.camera.process_mouse_movement(d.x, -d.y, true);
         }
         if response.hovered() {
-            // Wheel notches, like GLFW's scroll callback in the original.
-            let scroll: f32 = ui.input(|i| {
-                i.raw
-                    .events
-                    .iter()
-                    .map(|e| match e {
-                        egui::Event::MouseWheel {
-                            unit: egui::MouseWheelUnit::Line,
-                            delta,
-                            ..
-                        } => delta.y,
-                        egui::Event::MouseWheel {
-                            unit: egui::MouseWheelUnit::Point,
-                            delta,
-                            ..
-                        } => delta.y / 40.0,
-                        egui::Event::MouseWheel {
-                            unit: egui::MouseWheelUnit::Page,
-                            delta,
-                            ..
-                        } => delta.y * 10.0,
-                        _ => 0.0,
-                    })
-                    .sum()
-            });
+            let scroll = Self::wheel_notches(ui);
             if scroll != 0.0 {
                 self.camera.process_mouse_scroll(scroll / 40.0);
+            }
+        }
+    }
+
+    fn maya_input(&mut self, ui: &egui::Ui, response: &egui::Response) {
+        let (alt, command) = ui.input(|i| (i.modifiers.alt, i.modifiers.command));
+        if alt {
+            let d = response.drag_delta();
+            // Alt+Cmd+LMB (Alt+Ctrl off macOS) pans without a middle button, as Maya does on Mac.
+            if command && response.dragged_by(egui::PointerButton::Primary) {
+                self.camera.pan(d.x, d.y, response.rect.height());
+            } else if response.dragged_by(egui::PointerButton::Primary) {
+                self.camera.tumble(d.x, d.y);
+            } else if response.dragged_by(egui::PointerButton::Middle) {
+                self.camera.pan(d.x, d.y, response.rect.height());
+            } else if response.dragged_by(egui::PointerButton::Secondary) {
+                // Drag right or down to dolly in, left or up to dolly out.
+                self.camera.dolly((d.x + d.y) * 0.005);
+            }
+        }
+        if response.hovered() {
+            let scroll = Self::wheel_notches(ui);
+            if scroll != 0.0 {
+                self.camera.dolly(scroll * 0.1);
+            }
+            // Trackpad pinch.
+            let zoom = ui.input(|i| i.zoom_delta());
+            if zoom != 1.0 {
+                self.camera.dolly(zoom.ln());
             }
         }
     }
@@ -1003,7 +1081,11 @@ impl App {
             };
             let (s, r, t) = target.as_dmat4().to_scale_rotation_translation();
             let transform = Transform::from_scale_rotation_translation(s, r, t);
-            if let Some((_, new)) = self.gizmo.interact(ui, &[transform]) {
+            // Alt belongs to the camera in Maya mode, so Alt+LMB over the gizmo tumbles.
+            let camera_owns_mouse =
+                self.camera_controls == CameraControls::Maya && ui.input(|i| i.modifiers.alt);
+            let result = self.gizmo.interact(ui, &[transform]).filter(|_| !camera_owns_mouse);
+            if let Some((_, new)) = result {
                 if let Some(n) = new.first() {
                     let m = DMat4::from_scale_rotation_translation(
                         DVec3::from(n.scale),

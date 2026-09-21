@@ -1,0 +1,16 @@
+Third-party software
+====================
+
+This port contains no vendored third-party source code. Dependencies are
+fetched by Cargo and are all under permissive licenses (MIT and/or Apache-2.0,
+zlib, BSD). Run `cargo about` or `cargo license` for a full list when
+redistributing binaries, and ship their notices alongside.
+
+Main dependencies: wgpu, naga, eframe/egui, egui-wgpu, transform-gizmo-egui,
+gltf, image, glam, bytemuck, clap, rfd, flume, anyhow, log, env_logger, pollster.
+
+Test data
+=========
+
+tests/assets/BoxTextured.glb - CC-BY 4.0, (c) 2017 Cesium,
+from https://github.com/KhronosGroup/glTF-Sample-Assets

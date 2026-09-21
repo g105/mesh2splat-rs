@@ -1,0 +1,46 @@
+[package]
+name = "mesh2splat"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+description = "Fast mesh to 3D Gaussian splat conversion (Rust/wgpu port of EA SEED's Mesh2Splat)"
+license = "BSD-3-Clause"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "mesh2splat"
+path = "src/main.rs"
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:transform-gizmo-egui"]
+
+[dependencies]
+wgpu = "29"
+glam = { version = "0.32", features = ["bytemuck", "mint"] }
+bytemuck = { version = "1", features = ["derive"] }
+gltf = { version = "1.4", features = ["KHR_materials_emissive_strength", "extras", "names", "utils", "import"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+pollster = "0.4"
+clap = { version = "4", features = ["derive"] }
+flume = "0.11"
+
+eframe = { version = "0.34", optional = true, default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+egui = { version = "0.34", optional = true }
+rfd = { version = "0.17", optional = true }
+transform-gizmo-egui = { version = "0.9", optional = true }
+
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"

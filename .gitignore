@@ -1,0 +1,5 @@
+/target
+*.ply
+*.png
+assets/*.glb
+assets/*.gltf

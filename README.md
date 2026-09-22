@@ -116,7 +116,17 @@ mesh2splat                       # or: mesh2splat gui path/to/model.glb
 The side panel mirrors the original's ImGui windows:
 
 * **Input** — pick or drop a `.glb`, `.gltf` or `.ply` file.
-* **Output** — choose the output folder, file name and format (Standard / Standard SH0 / PBR / Compressed PBR), then press **Save splat**. *Standard SH0* leaves out the 45 higher-order SH coefficients, which are always zero for converted meshes, so files are about 3.6x smaller.
+* **Output** — choose the output folder, file name and format, then press **Save splat**:
+
+| Format | Bytes / splat | Notes |
+|---|---|---|
+| Standard | 248 | Original 3DGS layout, including 45 zero SH coefficients |
+| Standard SH0 | 68 | Same without the SH rest: ~3.6x smaller, still widely readable |
+| PBR | 76 | Adds metallic / roughness (the original's own layout) |
+| Compressed PBR | 48 | The original's quantised PBR layout |
+| Compressed (PlayCanvas / SuperSplat) | 16 | Chunked quantised layout, ~15x smaller than Standard |
+
+  The PlayCanvas layout groups splats into chunks of 256 that store the min/max of their positions, log-scales and colours; each splat is then four 32-bit words (position and scale 11/10/11 bits inside the chunk, rotation as smallest-three, 8-bit RGBA). It drops normals and PBR, so it is an export format for viewers rather than a round-trip for relighting. mesh2splat reads it back as well; on DamagedHelmet the round trip is 46 dB PSNR.
 * **Properties** — visualization mode (Final, Albedo, Depth, Normals, Geometry, Overdraw, PBR), mesh/gaussian depth test, gaussian scale, sampling density (16 up to 1024/2048/4096 px), projection box, **Detail-aware density** and **Merge similar splats** (see below), background color and split-screen.
 * **Lighting** — point light with intensity, color and a cube shadow map.
 * **Camera** — switch between the original fly controls and Maya-style controls, and frame the model.
@@ -124,7 +134,17 @@ The side panel mirrors the original's ImGui windows:
 * **Batch conversion** — pick a folder of meshes, optionally including subfolders, and convert them all.
 * **Stats** — gaussian counts, conversion time, a GPU frame-time graph and a prepass / sort / splat raster breakdown (these need timestamp query support). The viewport only re-renders when the view or settings change; tick **Continuous redraw** to profile.
 
-Camera controls default to the original fly camera:
+Camera controls default to Maya-style navigation around a pivot:
+
+| Input | Action |
+|---|---|
+| `Alt` + left drag | Tumble |
+| `Alt` + middle drag, or `Alt` + `Cmd` + left drag (`Alt` + `Ctrl` off macOS) | Pan |
+| `Alt` + right drag (horizontal), mouse wheel, or trackpad pinch | Dolly |
+| `F` | Frame the model, keeping the view direction |
+| `Q` `W` `E` `R` | Gizmo: none / move / rotate / scale |
+
+Select **Fly** in the **Camera** section for the original controls:
 
 | Input | Action |
 |---|---|
@@ -136,14 +156,7 @@ Camera controls default to the original fly camera:
 | Mouse wheel | Field of view |
 | `F` | Frame the model |
 
-Select **Maya** in the **Camera** section for Maya-style navigation around a pivot:
 
-| Input | Action |
-|---|---|
-| `Alt` + left drag | Tumble |
-| `Alt` + middle drag, or `Alt` + `Cmd` + left drag (`Alt` + `Ctrl` off macOS) | Pan |
-| `Alt` + right drag, mouse wheel, or trackpad pinch | Dolly |
-| `F` | Frame the model, keeping the view direction |
 
 ### CLI
 
@@ -154,6 +167,7 @@ mesh2splat convert model.glb --resolution 2048 --format pbr --std 0.65
 
 # SH0-only standard layout (much smaller, same visual result for converted meshes)
 mesh2splat convert model.glb -o model.ply --format sh0
+mesh2splat convert model.glb -o model.ply --format playcanvas   # ~15x smaller
 
 # sample low-detail triangles on a coarser grid (optional tolerance, default 0.25)
 mesh2splat convert model.glb -o model.ply --detail
@@ -203,7 +217,7 @@ ply::write_ply("model.ply", &gaussians.download(&ctx), PlyFormat::Standard, gaus
 ```
 src/
   scene.rs          glTF loading (node transforms baked, normals/tangents like the original)
-  ply.rs            PLY writer (3 layouts) and reader (standard / PBR / compressed)
+  ply.rs            PLY writers (5 layouts) and reader (standard / PBR / compressed / PlayCanvas)
   camera.rs         fly camera (port of Camera.cpp) + Maya tumble / pan / dolly
   merge.rs          optional quadtree merge of alike neighbouring splats (CPU reference)
   cli.rs, main.rs   clap CLI

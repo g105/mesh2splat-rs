@@ -48,7 +48,8 @@ pub enum SourceFormat {
     Ply = 1,
 }
 
-/// PLY export layouts (same three options as the original).
+/// PLY export layouts (the original's three, plus SH0-only and the PlayCanvas
+/// compressed layout).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PlyFormat {
     /// Standard 3DGS layout (positions, normals, f_dc, 45 x f_rest, opacity, scale, rot).
@@ -61,14 +62,18 @@ pub enum PlyFormat {
     Pbr,
     /// Quantised layout with 8-bit color, octahedral normals and 8-bit PBR.
     CompressedPbr,
+    /// PlayCanvas / SuperSplat compressed PLY: chunks of 256 splats with
+    /// quantised position, rotation, scale and colour (~16 bytes per splat).
+    PlayCanvas,
 }
 
 impl PlyFormat {
-    pub const ALL: [PlyFormat; 4] = [
+    pub const ALL: [PlyFormat; 5] = [
         PlyFormat::Standard,
         PlyFormat::StandardSh0,
         PlyFormat::Pbr,
         PlyFormat::CompressedPbr,
+        PlyFormat::PlayCanvas,
     ];
 
     pub fn label(self) -> &'static str {
@@ -77,6 +82,7 @@ impl PlyFormat {
             PlyFormat::StandardSh0 => "PLY Standard, SH0 only (smaller)",
             PlyFormat::Pbr => "PLY PBR",
             PlyFormat::CompressedPbr => "PLY Compressed PBR",
+            PlyFormat::PlayCanvas => "PLY Compressed (PlayCanvas / SuperSplat)",
         }
     }
 }

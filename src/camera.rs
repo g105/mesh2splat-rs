@@ -222,6 +222,41 @@ impl Camera {
 mod tests {
     use super::*;
 
+    /// Maya's convention: the model follows the cursor. Dragging right spins it
+    /// to the right, which swings the camera to its left; dragging down tips the
+    /// top towards you, which lifts the camera.
+    #[test]
+    fn maya_drag_directions() {
+        // Camera on +Z looking at the origin.
+        let mut c = Camera::new(Vec3::new(0.0, 0.0, 5.0), Vec3::Y, -90.0, 0.0);
+        c.orbit_distance = 5.0;
+        assert!((c.pivot() - Vec3::ZERO).length() < 1e-4);
+
+        let mut right = c.clone();
+        right.tumble(50.0, 0.0);
+        assert!(right.position.x < -0.1, "drag right: {}", right.position);
+
+        let mut down = c.clone();
+        down.tumble(0.0, 50.0);
+        assert!(down.position.y > 0.1, "drag down: {}", down.position);
+
+        // Panning right slides the camera (and its pivot) left.
+        let mut pan = c.clone();
+        pan.pan(50.0, 0.0, 600.0);
+        assert!(pan.position.x < -0.01, "pan right: {}", pan.position);
+        let mut pan_down = c.clone();
+        pan_down.pan(0.0, 50.0, 600.0);
+        assert!(pan_down.position.y > 0.01, "pan down: {}", pan_down.position);
+
+        // Dolly in moves towards the pivot, out moves away.
+        let mut near = c.clone();
+        near.dolly(0.25);
+        assert!(near.orbit_distance < 5.0 && near.position.z < 5.0);
+        let mut far = c.clone();
+        far.dolly(-0.25);
+        assert!(far.orbit_distance > 5.0 && far.position.z > 5.0);
+    }
+
     #[test]
     fn maya_controls_keep_pivot() {
         let mut c = Camera::default();

@@ -63,6 +63,7 @@ fn main() {
         ConvertSettings {
             resolution: 512,
             bbox_mode: BBoxMode::PerMesh,
+            merge: None,
         },
         &mut gb,
     );

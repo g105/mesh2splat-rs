@@ -25,6 +25,7 @@ struct VsOut {
     @location(3) normal: vec3<f32>,
     @location(4) @interpolate(flat) scale: vec3<f32>,
     @location(5) @interpolate(flat) quat: vec4<f32>,
+    @location(6) @interpolate(flat) axis: u32,
 };
 
 // Copied and translated from GLM (quat_cast). Returns (x, y, z, w).
@@ -114,6 +115,14 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
     out.normal = this_v.normal.xyz;
     out.scale = vec3<f32>(length(j[0]), length(j[1]), 1e-7);
     out.quat = vec4<f32>(q.w, q.x, q.y, q.z);
+    // Same branch order as ortho_uv.
+    if (an.x > an.y && an.x > an.z) {
+        out.axis = 0u;
+    } else if (an.y > an.z) {
+        out.axis = 1u;
+    } else {
+        out.axis = 2u;
+    }
     return out;
 }
 
@@ -147,8 +156,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         var g: Gaussian;
         g.position = vec4<f32>(in.position, 1.0);
         g.color = color * params.base_color_factor;
-        g.scale = vec4<f32>(in.scale, 0.0);
-        g.normal = vec4<f32>(n, 0.0);
+        // Spare .w slots record where the splat sits on the conversion grid
+        // (read back by `merge`): axis << 30 | y << 15 | x, and the mesh index.
+        let cell = vec2<u32>(in.clip.xy);
+        let grid = (in.axis << 30u) | (min(cell.y, 0x7fffu) << 15u) | min(cell.x, 0x7fffu);
+        g.scale = vec4<f32>(in.scale, bitcast<f32>(grid));
+        g.normal = vec4<f32>(n, bitcast<f32>(u32(params.bbox_min.w)));
         g.rotation = in.quat;
         g.pbr = vec4<f32>(metal_rough, 0.0, 1.0);
         gaussians[index] = g;

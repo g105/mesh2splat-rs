@@ -46,6 +46,7 @@ fn convert_export_reload() {
         ConvertSettings {
             resolution: res,
             bbox_mode: BBoxMode::Scene,
+            merge: None,
         },
         &mut gb,
     );
@@ -76,4 +77,53 @@ fn convert_export_reload() {
         assert!((back.gaussians[10].scale[0] - expected_sx).abs() / expected_sx < 1e-4);
         std::fs::remove_file(&path).ok();
     }
+}
+
+#[test]
+fn merge_after_gpu_conversion() {
+    let ctx = match GpuContext::new_headless() {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipping: {e}"),
+    };
+    let s = scene::load_gltf(BOX).unwrap();
+    let gpu = GpuScene::upload(&ctx, &s);
+    let mut conv = Converter::new(&ctx);
+    let settings = |merge| ConvertSettings {
+        resolution: 128,
+        bbox_mode: BBoxMode::Scene,
+        merge,
+    };
+    let mut plain = GaussianBuffer::new_empty(&ctx);
+    conv.convert(&ctx, &gpu, settings(None), &mut plain);
+    let mut merged = GaussianBuffer::new_empty(&ctx);
+    let stats = conv.convert(
+        &ctx,
+        &gpu,
+        settings(Some(mesh2splat::merge::MergeSettings::from_strength(1.0))),
+        &mut merged,
+    );
+    let m = stats.merge.expect("merge stats");
+    assert_eq!(m.input, plain.count as usize);
+    assert_eq!(m.output, merged.count as usize);
+    // Opposite cube faces share grid cells; depth layering must still let them merge.
+    assert!(merged.count * 2 < plain.count, "{m:?}");
+
+    // Merged splats stay on the surface, and the covered area is preserved
+    // (sum of the two in-plane scales' product).
+    let area = |g: &[mesh2splat::GaussianVertex]| -> f64 {
+        g.iter()
+            .map(|g| {
+                let mut s = [g.scale[0], g.scale[1], g.scale[2]];
+                s.sort_by(f32::total_cmp);
+                (s[1] * s[2]) as f64
+            })
+            .sum()
+    };
+    let (a, b) = (plain.download(&ctx), merged.download(&ctx));
+    for g in &b {
+        let p = glam::Vec3::from_slice(&g.position[..3]);
+        assert!((p.abs().max_element() - 0.5).abs() < 1e-3, "{p}");
+    }
+    let (aa, ab) = (area(&a), area(&b));
+    assert!((aa - ab).abs() / aa < 0.01, "{aa} vs {ab}");
 }

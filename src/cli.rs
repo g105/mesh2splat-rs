@@ -82,6 +82,10 @@ pub struct SamplingArgs {
     /// Bounding box used for the planar re-projection.
     #[arg(long, value_enum, default_value_t = BBoxArg::Scene)]
     pub bbox: BBoxArg,
+    /// Merge alike neighbouring splats into larger ones, with an optional
+    /// strength in [0, 1] (0 = only identical splats, default 0.25).
+    #[arg(long, value_name = "STRENGTH", num_args = 0..=1, default_missing_value = "0.25")]
+    pub merge: Option<f32>,
 }
 
 impl SamplingArgs {
@@ -94,6 +98,7 @@ impl SamplingArgs {
                 BBoxArg::Scene => BBoxMode::Scene,
                 BBoxArg::PerMesh => BBoxMode::PerMesh,
             },
+            merge: self.merge.map(crate::merge::MergeSettings::from_strength),
         }
     }
 }

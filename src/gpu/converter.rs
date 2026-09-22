@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use super::scene::{mesh_bind_group_layout, GpuScene};
 use super::{pipeline_layout, shader_with_common, storage_entry, GaussianBuffer, GpuContext};
-use crate::types::{SourceFormat, MAX_GAUSSIANS};
+use crate::merge::{self, GridInfo, MergeSettings, MergeStats};
+use crate::types::{GaussianVertex, SourceFormat, MAX_GAUSSIANS};
+use wgpu::util::DeviceExt;
 
 /// Which bounding box drives the planar re-projection of each mesh.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -22,6 +24,8 @@ pub struct ConvertSettings {
     /// Side of the square conversion render target ("sampling density").
     pub resolution: u32,
     pub bbox_mode: BBoxMode,
+    /// Merge alike neighbouring splats into larger ones after conversion.
+    pub merge: Option<MergeSettings>,
 }
 
 impl Default for ConvertSettings {
@@ -30,6 +34,7 @@ impl Default for ConvertSettings {
         Self {
             resolution: resolution_from_quality(0.5, 1024),
             bbox_mode: BBoxMode::Scene,
+            merge: None,
         }
     }
 }
@@ -41,7 +46,10 @@ pub fn resolution_from_quality(quality: f32, max_res: u32) -> u32 {
 }
 
 pub struct ConversionStats {
+    /// Final splat count (after merging, if enabled).
     pub gaussians: u32,
+    /// Merge results, when merging was enabled.
+    pub merge: Option<MergeStats>,
     /// Fragments generated (can exceed capacity, in which case splats were dropped).
     pub fragments: u32,
     pub capacity: u32,
@@ -142,13 +150,14 @@ impl Converter {
         let capacity = Self::capacity_for(res, scene.meshes.len(), ctx.max_gaussians());
         out.ensure_capacity(ctx, capacity);
 
-        for mesh in &scene.meshes {
+        for (mesh_index, mesh) in scene.meshes.iter().enumerate() {
             let mut p = mesh.params;
             let bbox = match settings.bbox_mode {
                 BBoxMode::Scene => scene.bbox,
                 BBoxMode::PerMesh => mesh.bbox,
             };
-            p.bbox_min = bbox.min.extend(0.0).to_array();
+            // .w carries the mesh index into the gaussians (see convert.wgsl).
+            p.bbox_min = bbox.min.extend(mesh_index as f32).to_array();
             p.bbox_max = bbox.max.extend(0.0).to_array();
             p.flags[3] = capacity;
             ctx.queue
@@ -224,7 +233,8 @@ impl Converter {
         let count = fragments.min(capacity);
 
         // Shrink the buffer to the actual count to release the (possibly large) reserve.
-        if count > 0 && count < capacity {
+        // (Merging replaces the buffer anyway.)
+        if count > 0 && count < capacity && settings.merge.is_none() {
             let size = count as u64 * 96;
             let compact = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("gaussians"),
@@ -239,6 +249,35 @@ impl Converter {
             out.capacity = count;
         }
 
+        let mut merge_stats = None;
+        let count = match settings.merge {
+            Some(cfg) if count > 0 => {
+                let splats: Vec<GaussianVertex> = bytemuck::cast_slice(&ctx.read_buffer(
+                    &out.buffer,
+                    0,
+                    count as u64 * std::mem::size_of::<GaussianVertex>() as u64,
+                ))
+                .to_vec();
+                let grid = GridInfo {
+                    resolution: res,
+                    boxes: match settings.bbox_mode {
+                        BBoxMode::Scene => vec![scene.bbox],
+                        BBoxMode::PerMesh => scene.meshes.iter().map(|m| m.bbox).collect(),
+                    },
+                };
+                let (merged, stats) = merge::merge(&splats, &grid, &cfg);
+                out.buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("gaussians"),
+                    contents: bytemuck::cast_slice(&merged),
+                    usage: GaussianBuffer::USAGE,
+                });
+                out.capacity = merged.len() as u32;
+                merge_stats = Some(stats);
+                merged.len() as u32
+            }
+            _ => count,
+        };
+
         out.count = count;
         out.format = SourceFormat::Converted;
         out.ply_has_pbr = false;
@@ -250,6 +289,7 @@ impl Converter {
         }
         ConversionStats {
             gaussians: count,
+            merge: merge_stats,
             fragments,
             capacity,
             duration: start.elapsed(),

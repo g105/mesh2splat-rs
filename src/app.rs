@@ -14,6 +14,7 @@ use transform_gizmo_egui::{Gizmo, GizmoConfig, GizmoExt, GizmoMode, GizmoOrienta
 
 use crate::camera::{Camera, CameraKeys};
 use crate::gpu::converter::{resolution_from_quality, ConversionStats};
+use crate::merge::MergeSettings;
 use crate::gpu::renderer::OUTPUT_FORMAT;
 use crate::gpu::{
     BBoxMode, ConvertSettings, Converter, GaussianBuffer, GpuContext, GpuScene, RenderSettings,
@@ -165,6 +166,8 @@ pub struct App {
     quality: f32,
     max_res: u32,
     bbox_mode: BBoxMode,
+    merge_enabled: bool,
+    merge_strength: f32,
     needs_conversion: bool,
     last_conversion: Option<ConversionStats>,
 
@@ -248,6 +251,8 @@ impl App {
             quality: 0.5,
             max_res: 1024,
             bbox_mode: BBoxMode::Scene,
+            merge_enabled: false,
+            merge_strength: MergeSettings::DEFAULT_STRENGTH,
             needs_conversion: false,
             last_conversion: None,
             output_folder: String::new(),
@@ -310,6 +315,9 @@ impl App {
         ConvertSettings {
             resolution: self.resolution(),
             bbox_mode: self.bbox_mode,
+            merge: self
+                .merge_enabled
+                .then(|| MergeSettings::from_strength(self.merge_strength)),
         }
     }
 
@@ -655,6 +663,20 @@ impl App {
                         }
                     }
                 });
+                if ui
+                    .checkbox(&mut self.merge_enabled, "Merge similar splats")
+                    .on_hover_text("Replace blocks of neighbouring splats with the same colour, normal and material by one larger splat (up to 16x16). Fewer splats: faster rendering and smaller files.")
+                    .changed()
+                {
+                    self.needs_conversion = true;
+                }
+                if self.merge_enabled {
+                    // Merging runs on the CPU, so only re-convert when the slider is released.
+                    let r = ui.add(egui::Slider::new(&mut self.merge_strength, 0.0..=1.0).text("Merge strength"));
+                    if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                        self.needs_conversion = true;
+                    }
+                }
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Background");
@@ -829,6 +851,14 @@ impl App {
                 c.duration.as_secs_f64() * 1e3,
                 self.gaussians.resolution
             ));
+            if let Some(m) = &c.merge {
+                ui.label(format!(
+                    "Merged {} -> {} splats ({:.1}x fewer)",
+                    fmt_thousands(m.input as u64),
+                    fmt_thousands(m.output as u64),
+                    m.input as f64 / m.output.max(1) as f64
+                ));
+            }
         }
         let latest = self.frame_times.back().copied().unwrap_or(0.0);
         let label = if stats.gpu_ms.is_some() {

@@ -31,6 +31,31 @@ triangle from a storage buffer and computes the same values
 (`src/gpu/shaders/convert.wgsl`). The fragment shader appends gaussians to a
 storage buffer with an atomic counter, exactly like the original.
 
+### Merging similar splats
+
+Optional, and not in the original. After conversion, blocks of 2x2 neighbouring
+splats on the projection grid are replaced by one splat of twice the size
+when their colour, normal, metallic/roughness and flatness stay within a
+tolerance. Merged blocks can merge again, up to 16x16. Surfaces that overlap
+in the projection (the front and back of a closed mesh) are kept apart by
+depth, and surface edges keep their fine splats (`src/merge.rs`). One
+**strength** knob sets the tolerances.
+
+On DamagedHelmet (PSNR against the unmerged render, 1920x1080):
+
+| | splats | PSNR (orbit views) | PSNR (close-up) |
+|---|---|---|---|
+| 520 px, no merge | 1.04 M | reference | reference |
+| 520 px, strength 0.25 (default) | 545 k | 44–45 dB | 36 dB |
+| 370 px, no merge (same count) | 528 k | 39–41 dB | 32 dB |
+| 520 px, strength 0.5 | 398 k | 39–41 dB | 31 dB |
+| 520 px, strength 1.0 | 277 k | 36–37 dB | 28 dB |
+
+At high strength it is no better than lowering the sampling density, so the
+useful range is roughly 0.1–0.5. Converting at a higher resolution and merging
+also works: 1024 px at strength 1.0 gives 771 k splats at the quality of 520 px
+unmerged (1.04 M). Merging runs on the CPU (about 0.2 s for 1 M splats on an M1).
+
 ## Building
 
 You need Rust 1.92 or newer and a GPU with Vulkan, Metal or DX12.
@@ -55,7 +80,7 @@ The side panel mirrors the original's ImGui windows:
 
 * **Input** — pick or drop a `.glb`, `.gltf` or `.ply` file.
 * **Output** — choose the output folder, file name and format (Standard / Standard SH0 / PBR / Compressed PBR), then press **Save splat**. *Standard SH0* leaves out the 45 higher-order SH coefficients, which are always zero for converted meshes, so files are about 3.6x smaller.
-* **Properties** — visualization mode (Final, Albedo, Depth, Normals, Geometry, Overdraw, PBR), mesh/gaussian depth test, gaussian scale, sampling density (16 up to 1024/2048/4096 px), projection box, background color and split-screen.
+* **Properties** — visualization mode (Final, Albedo, Depth, Normals, Geometry, Overdraw, PBR), mesh/gaussian depth test, gaussian scale, sampling density (16 up to 1024/2048/4096 px), projection box, **Merge similar splats** (see below), background color and split-screen.
 * **Lighting** — point light with intensity, color and a cube shadow map.
 * **Camera** — switch between the original fly controls and Maya-style controls, and frame the model.
 * **Gizmo** — translate, rotate or scale the model or the light (local or world axes).
@@ -93,6 +118,10 @@ mesh2splat convert model.glb --resolution 2048 --format pbr --std 0.65
 # SH0-only standard layout (much smaller, same visual result for converted meshes)
 mesh2splat convert model.glb -o model.ply --format sh0
 
+# merge alike neighbouring splats (optional strength, default 0.25)
+mesh2splat convert model.glb -o model.ply --merge
+mesh2splat convert model.glb -o model.ply --resolution 1024 --merge 0.5
+
 # batch (like the original's batch window)
 mesh2splat convert --batch ./meshes -o ./splats --recursive --format compressed
 
@@ -111,6 +140,7 @@ defaults (`q = 0.5`, `max_res = 1024`, giving 520 px, and `std = 0.65`) match th
 ```bash
 cargo run --release --example bench -- assets/DamagedHelmet.glb --res 520,1024 --size 1920x1080
 cargo run --release --example bench -- --baseline target/bench/baseline   # also print PSNR vs saved PNGs
+cargo run --release --example bench -- --merge 0.25 --baseline target/bench  # merged vs unmerged
 ```
 
 For each sampling resolution this converts the model, renders five views and prints the splat count, median GPU time for prepass, sort and splat raster, and the PLY size of every export format.
@@ -135,6 +165,7 @@ src/
   scene.rs          glTF loading (node transforms baked, normals/tangents like the original)
   ply.rs            PLY writer (3 layouts) and reader (standard / PBR / compressed)
   camera.rs         fly camera (port of Camera.cpp) + Maya tumble / pan / dolly
+  merge.rs          optional quadtree merge of alike neighbouring splats
   cli.rs, main.rs   clap CLI
   app.rs            eframe/egui UI (port of ImGuiUI + GuiRendererConcreteMediator)
   gpu/

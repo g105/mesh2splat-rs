@@ -3,11 +3,12 @@
 //! ```text
 //! cargo run --release --example bench -- [model.glb] [--res 520,1024] [--size 1920x1080]
 //!                                        [--frames 60] [--out target/bench] [--baseline dir]
+//!                                        [--merge strength]
 //! ```
 //!
 //! For each sampling resolution it converts the model, renders a fixed set of
 //! views and reports splat counts, median GPU times per stage and PLY sizes per
-//! export format. The first view of each run is saved as a PNG in `--out`, so
+//! export format. Every view is saved as a PNG in `--out`, so
 //! later changes can be compared visually; with `--baseline` it also prints the
 //! PSNR against the PNG of the same name in that folder.
 //!
@@ -28,6 +29,7 @@ struct Args {
     frames: usize,
     out: PathBuf,
     baseline: Option<PathBuf>,
+    merge: Option<f32>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -38,6 +40,7 @@ fn parse_args() -> Result<Args> {
         frames: 60,
         out: "target/bench".into(),
         baseline: None,
+        merge: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -57,6 +60,7 @@ fn parse_args() -> Result<Args> {
             "--frames" => a.frames = val()?.parse()?,
             "--out" => a.out = val()?.into(),
             "--baseline" => a.baseline = Some(val()?.into()),
+            "--merge" => a.merge = Some(val()?.parse()?),
             _ => a.model = arg.into(),
         }
     }
@@ -149,6 +153,7 @@ fn main() -> Result<()> {
             &gpu_scene,
             ConvertSettings {
                 resolution: res,
+                merge: args.merge.map(mesh2splat::merge::MergeSettings::from_strength),
                 ..Default::default()
             },
             &mut gaussians,
@@ -158,12 +163,21 @@ fn main() -> Result<()> {
             conv.gaussians,
             conv.duration.as_secs_f64() * 1e3
         );
+        if let Some(m) = &conv.merge {
+            println!(
+                "   merged {} -> {} ({:.2}x fewer), new splats per level {:?}",
+                m.input,
+                m.output,
+                m.input as f64 / m.output.max(1) as f64,
+                m.merged_per_level
+            );
+        }
 
         println!(
             "{:<6} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9}",
             "view", "visible", "frame", "prepass", "sort", "raster", "wall"
         );
-        for (i, (name, cam)) in views(&framed).iter().enumerate() {
+        for (name, cam) in views(&framed).iter() {
             let (mut frame, mut pre, mut sort, mut raster, mut wall) =
                 (vec![], vec![], vec![], vec![], vec![]);
             let mut visible = 0;
@@ -198,7 +212,7 @@ fn main() -> Result<()> {
                 median(&mut raster),
                 median(&mut wall)
             );
-            if i == 0 {
+            {
                 let (w, h, px) = renderer.read_output(&ctx).context("no output")?;
                 let file = format!("res{res}_{name}.png");
                 image::save_buffer(args.out.join(&file), &px, w, h, image::ExtendedColorType::Rgba8)?;

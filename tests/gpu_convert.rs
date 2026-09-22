@@ -76,6 +76,7 @@ fn quad_conversion_matches_analytic_result() {
         ConvertSettings {
             resolution: res,
             bbox_mode: BBoxMode::Scene,
+            merge: None,
         },
         &mut gb,
     );
@@ -144,6 +145,7 @@ fn bbox_modes_and_multi_mesh() {
         ConvertSettings {
             resolution: res,
             bbox_mode: BBoxMode::PerMesh,
+            merge: None,
         },
         &mut gb,
     );
@@ -156,6 +158,7 @@ fn bbox_modes_and_multi_mesh() {
         ConvertSettings {
             resolution: res,
             bbox_mode: BBoxMode::Scene,
+            merge: None,
         },
         &mut gb,
     );
@@ -182,6 +185,7 @@ fn renders_converted_quad() {
         ConvertSettings {
             resolution: 128,
             bbox_mode: BBoxMode::Scene,
+            merge: None,
         },
         &mut gb,
     );
@@ -271,6 +275,7 @@ fn lighting_and_shadows_run() {
         ConvertSettings {
             resolution: 256,
             bbox_mode: BBoxMode::PerMesh,
+            merge: None,
         },
         &mut gb,
     );

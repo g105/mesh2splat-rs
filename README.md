@@ -130,19 +130,33 @@ The side panel mirrors the original's ImGui windows:
 * **Properties** — visualization mode (Final, Albedo, Depth, Normals, Geometry, Overdraw, PBR), mesh/gaussian depth test, gaussian scale, sampling density (16 up to 1024/2048/4096 px), projection box, **Detail-aware density** and **Merge similar splats** (see below), background color and split-screen.
 * **Lighting** — point light with intensity, color and a cube shadow map.
 * **Camera** — switch between the original fly controls and Maya-style controls, and frame the model.
-* **Gizmo** — translate, rotate or scale the model or the light (local or world axes).
+* **Gizmo** — translate, rotate or scale the model or the light (local or world axes), and set the on-screen gizmo size (`+` / `-` / `0` in the viewport).
 * **Batch conversion** — pick a folder of meshes, optionally including subfolders, and convert them all.
 * **Stats** — gaussian counts, conversion time, a GPU frame-time graph and a prepass / sort / splat raster breakdown (these need timestamp query support). The viewport only re-renders when the view or settings change; tick **Continuous redraw** to profile.
 
 Camera controls default to Maya-style navigation around a pivot:
 
+Hold `Alt` **or** `Cmd` (`Ctrl` off macOS) and drag:
+
 | Input | Action |
 |---|---|
-| `Alt` + left drag | Tumble |
-| `Alt` + middle drag, or `Alt` + `Cmd` + left drag (`Alt` + `Ctrl` off macOS) | Pan |
-| `Alt` + right drag (horizontal), mouse wheel, or trackpad pinch | Dolly |
+| modifier + left drag | Tumble |
+| modifier + middle drag, or `Alt` + `Cmd` + left drag | Pan |
+| modifier + right drag (horizontal), mouse wheel, or trackpad pinch | Dolly |
 | `F` | Frame the model, keeping the view direction |
 | `Q` `W` `E` `R` | Gizmo: none / move / rotate / scale |
+| `+` / `-` / `0` | Grow / shrink / reset the gizmo (bigger handles are easier to grab) |
+
+Maya itself only uses `Alt`; `Cmd` / `Ctrl` works too because GNOME and KDE grab
+`Alt` + drag to move windows. Without a modifier, a left drag belongs to the
+transform gizmo, so the gizmo can stay on screen while you navigate: holding the
+modifier gives the mouse to the camera even when the drag starts on a gizmo
+handle, and a drag already under way keeps it until the button is released.
+
+The camera reads the raw pointer state rather than the viewport's egui
+`Response`, because `transform-gizmo-egui` registers its own interaction widget
+under the cursor every frame and would otherwise swallow every camera drag
+(`tests/viewport_input.rs` pins this down).
 
 Select **Fly** in the **Camera** section for the original controls:
 

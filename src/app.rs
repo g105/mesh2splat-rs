@@ -10,7 +10,9 @@ use eframe::egui_wgpu;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use glam::{DMat4, DQuat, DVec3, Mat4, Vec3};
 use transform_gizmo_egui::math::Transform;
-use transform_gizmo_egui::{Gizmo, GizmoConfig, GizmoExt, GizmoMode, GizmoOrientation};
+use transform_gizmo_egui::{
+    Gizmo, GizmoConfig, GizmoExt, GizmoMode, GizmoOrientation, GizmoVisuals,
+};
 
 use crate::camera::{Camera, CameraKeys};
 use crate::gpu::converter::{resolution_from_quality, ConversionStats, DetailSettings};
@@ -112,6 +114,56 @@ enum GizmoTarget {
     Light,
 }
 
+/// Default on-screen gizmo radius, in points (`GizmoVisuals::default()`).
+const DEFAULT_GIZMO_SIZE: f32 = 75.0;
+const GIZMO_SIZE_RANGE: std::ops::RangeInclusive<f32> = 24.0..=400.0;
+
+/// One `+` / `-` / `0` step on the gizmo size, clamped to the usable range.
+fn resize_gizmo(size: f32, grow: bool, shrink: bool, reset: bool) -> f32 {
+    const STEP: f32 = 1.25;
+    if reset {
+        return DEFAULT_GIZMO_SIZE;
+    }
+    let scaled = match (grow, shrink) {
+        (true, false) => size * STEP,
+        (false, true) => size / STEP,
+        _ => size,
+    };
+    scaled.clamp(*GIZMO_SIZE_RANGE.start(), *GIZMO_SIZE_RANGE.end())
+}
+
+/// What a viewport drag does in Maya mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Nav {
+    None,
+    Tumble,
+    Pan,
+    Dolly,
+}
+
+/// Maya navigation is modifier + mouse button. Maya itself uses Alt, but some
+/// window managers (GNOME, KDE) grab Alt+drag to move windows, so Cmd (Ctrl off
+/// macOS) drives the camera too.
+fn maya_nav(alt: bool, command: bool, primary: bool, middle: bool, secondary: bool) -> Nav {
+    if !(alt || command) {
+        return Nav::None;
+    }
+    if primary {
+        // Maya on macOS pans with Option+Cmd+LMB.
+        if alt && command {
+            Nav::Pan
+        } else {
+            Nav::Tumble
+        }
+    } else if middle {
+        Nav::Pan
+    } else if secondary {
+        Nav::Dolly
+    } else {
+        Nav::None
+    }
+}
+
 /// Viewport navigation scheme.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CameraControls {
@@ -187,6 +239,13 @@ pub struct App {
     gizmo_target: GizmoTarget,
     gizmo_op: GizmoOp,
     gizmo_orientation: GizmoOrientation,
+    /// On-screen gizmo radius in points (`+` / `-` in the viewport).
+    gizmo_size: f32,
+    /// Camera drag in progress, latched when it started inside the viewport.
+    /// The transform gizmo registers its own interaction widget under the
+    /// cursor every frame, so a drag that starts on it never reaches the
+    /// viewport's `Response`; the raw pointer state is ours either way.
+    nav_drag: Option<Nav>,
 
     // loading
     tx: flume::Sender<Loaded>,
@@ -270,6 +329,8 @@ impl App {
             gizmo_target: GizmoTarget::Model,
             gizmo_op: GizmoOp::Translate,
             gizmo_orientation: GizmoOrientation::Local,
+            gizmo_size: DEFAULT_GIZMO_SIZE,
+            nav_drag: None,
             tx,
             rx,
             loading: None,
@@ -753,9 +814,15 @@ impl App {
                     ui.radio_value(&mut self.gizmo_op, GizmoOp::Rotate, "Rotate");
                     ui.radio_value(&mut self.gizmo_op, GizmoOp::Scale, "Scale");
                 });
+                ui.add(
+                    egui::Slider::new(&mut self.gizmo_size, GIZMO_SIZE_RANGE)
+                        .text("Gizmo size")
+                        .logarithmic(true),
+                );
                 if self.camera_controls == CameraControls::Maya {
                     ui.small("Hotkeys: Q none, W move, E rotate, R scale.");
                 }
+                ui.small("+ / - resize the gizmo in the viewport, 0 resets it.");
                 if self.gizmo_op != GizmoOp::Scale {
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut self.gizmo_orientation, GizmoOrientation::Local, "Local");
@@ -785,7 +852,7 @@ impl App {
             ui.separator();
             ui.small(match self.camera_controls {
                 CameraControls::Fly => "Camera: RMB drag to look, WASD move, Q/E down/up, R/T roll, Shift fast, Ctrl slow, wheel zoom, F frame.",
-                CameraControls::Maya => "Camera: Alt+LMB tumble, Alt+MMB or Alt+Cmd+LMB pan, Alt+RMB / wheel / pinch dolly, F frame, Q/W/E/R tools.",
+                CameraControls::Maya => "Camera (Alt or Cmd): +LMB tumble, +MMB or Alt+Cmd+LMB pan, +RMB / wheel / pinch dolly. F frame, Q/W/E/R tools, +/- gizmo size.",
             });
         });
     }
@@ -989,6 +1056,18 @@ impl App {
         if !wants_kb && response.hovered() && ui.input(|i| i.key_pressed(egui::Key::F)) {
             self.focus_model();
         }
+        // `+` / `-` resize the gizmo (handy when it is small on screen);
+        // `0` restores the default.
+        if !wants_kb && response.hovered() {
+            let (grow, shrink, reset) = ui.input(|i| {
+                (
+                    i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
+                    i.key_pressed(egui::Key::Minus),
+                    i.key_pressed(egui::Key::Num0),
+                )
+            });
+            self.gizmo_size = resize_gizmo(self.gizmo_size, grow, shrink, reset);
+        }
         // Maya's tool hotkeys; in Fly mode these keys drive the camera.
         if !wants_kb && self.camera_controls == CameraControls::Maya {
             ui.input(|i| {
@@ -1026,8 +1105,23 @@ impl App {
             });
             self.camera.process_keyboard(dt, keys);
         }
-        if response.dragged_by(egui::PointerButton::Secondary) {
-            let d = response.drag_delta() * ui.ctx().pixels_per_point();
+        // Same as Maya mode: the gizmo would otherwise take the drag.
+        let (looking, pressed, delta, pointer) = ui.input(|i| {
+            (
+                i.pointer.button_down(egui::PointerButton::Secondary),
+                i.pointer.button_pressed(egui::PointerButton::Secondary),
+                i.pointer.delta(),
+                i.pointer.interact_pos(),
+            )
+        });
+        if pressed && pointer.is_some_and(|p| response.rect.contains(p)) {
+            self.nav_drag = Some(Nav::Tumble); // "look" reuses the drag latch
+        }
+        if !looking {
+            self.nav_drag = None;
+        }
+        if self.nav_drag.is_some() {
+            let d = delta * ui.ctx().pixels_per_point();
             self.camera.process_mouse_movement(d.x, -d.y, true);
         }
         if response.hovered() {
@@ -1039,20 +1133,39 @@ impl App {
     }
 
     fn maya_input(&mut self, ui: &egui::Ui, response: &egui::Response) {
-        let (alt, command) = ui.input(|i| (i.modifiers.alt, i.modifiers.command));
-        if alt {
-            let d = response.drag_delta();
-            // Alt+Cmd+LMB (Alt+Ctrl off macOS) pans without a middle button, as Maya does on Mac.
-            if command && response.dragged_by(egui::PointerButton::Primary) {
-                self.camera.pan(d.x, d.y, response.rect.height());
-            } else if response.dragged_by(egui::PointerButton::Primary) {
-                self.camera.tumble(d.x, d.y);
-            } else if response.dragged_by(egui::PointerButton::Middle) {
-                self.camera.pan(d.x, d.y, response.rect.height());
-            } else if response.dragged_by(egui::PointerButton::Secondary) {
-                // Maya's dolly is horizontal: drag right to move in, left to move out.
-                self.camera.dolly(d.x * 0.005);
-            }
+        let (alt, command, buttons, pressed, delta, pointer) = ui.input(|i| {
+            let b = |btn| i.pointer.button_down(btn);
+            (
+                i.modifiers.alt,
+                i.modifiers.command,
+                [
+                    b(egui::PointerButton::Primary),
+                    b(egui::PointerButton::Middle),
+                    b(egui::PointerButton::Secondary),
+                ],
+                i.pointer.any_pressed(),
+                i.pointer.delta(),
+                i.pointer.interact_pos(),
+            )
+        });
+        // Latch on press, so releasing the modifier mid-drag keeps navigating.
+        let over_viewport = pointer.is_some_and(|p| response.rect.contains(p));
+        if pressed && over_viewport && self.nav_drag.is_none() {
+            self.nav_drag = match maya_nav(alt, command, buttons[0], buttons[1], buttons[2]) {
+                Nav::None => None,
+                nav => Some(nav),
+            };
+        }
+        if !buttons.iter().any(|b| *b) {
+            self.nav_drag = None;
+        }
+        let d = delta;
+        match self.nav_drag {
+            Some(Nav::Tumble) => self.camera.tumble(d.x, d.y),
+            Some(Nav::Pan) => self.camera.pan(d.x, d.y, response.rect.height()),
+            // Maya's dolly is horizontal: drag right to move in, left to move out.
+            Some(Nav::Dolly) => self.camera.dolly(d.x * 0.005),
+            Some(Nav::None) | None => {}
         }
         if response.hovered() {
             let scroll = Self::wheel_notches(ui);
@@ -1191,6 +1304,10 @@ impl App {
                 viewport: rect,
                 modes,
                 orientation: self.gizmo_orientation,
+                visuals: GizmoVisuals {
+                    gizmo_size: self.gizmo_size,
+                    ..Default::default()
+                },
                 ..Default::default()
             });
             let target = match self.gizmo_target {
@@ -1199,9 +1316,13 @@ impl App {
             };
             let (s, r, t) = target.as_dmat4().to_scale_rotation_translation();
             let transform = Transform::from_scale_rotation_translation(s, r, t);
-            // Alt belongs to the camera in Maya mode, so Alt+LMB over the gizmo tumbles.
-            let camera_owns_mouse =
-                self.camera_controls == CameraControls::Maya && ui.input(|i| i.modifiers.alt);
+            // The navigation modifiers belong to the camera in Maya mode, so
+            // Alt/Cmd + drag over the gizmo moves the view instead of the model.
+            // A drag already under way keeps the mouse even if the modifier is
+            // released, so the model cannot jump mid-tumble.
+            let camera_owns_mouse = self.camera_controls == CameraControls::Maya
+                && (self.nav_drag.is_some()
+                    || ui.input(|i| i.modifiers.alt || i.modifiers.command));
             let result = self.gizmo.interact(ui, &[transform]).filter(|_| !camera_owns_mouse);
             if let Some((_, new)) = result {
                 if let Some(n) = new.first() {
@@ -1264,6 +1385,53 @@ impl App {
                 ctx.request_repaint_after(std::time::Duration::from_secs_f32(left));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gizmo_resize_steps() {
+        let base = DEFAULT_GIZMO_SIZE;
+        let bigger = resize_gizmo(base, true, false, false);
+        assert!(bigger > base);
+        // Growing then shrinking comes back to where it started.
+        assert!((resize_gizmo(bigger, false, true, false) - base).abs() < 1e-3);
+        // Both or neither key: unchanged.
+        assert_eq!(resize_gizmo(base, true, true, false), base);
+        assert_eq!(resize_gizmo(base, false, false, false), base);
+        // Clamped at both ends, and `0` restores the default.
+        let mut small = base;
+        let mut big = base;
+        for _ in 0..50 {
+            small = resize_gizmo(small, false, true, false);
+            big = resize_gizmo(big, true, false, false);
+        }
+        assert_eq!(small, *GIZMO_SIZE_RANGE.start());
+        assert_eq!(big, *GIZMO_SIZE_RANGE.end());
+        assert_eq!(resize_gizmo(big, false, false, true), base);
+    }
+
+    #[test]
+    fn maya_navigation_mapping() {
+        // Maya's own bindings.
+        assert_eq!(maya_nav(true, false, true, false, false), Nav::Tumble);
+        assert_eq!(maya_nav(true, false, false, true, false), Nav::Pan);
+        assert_eq!(maya_nav(true, false, false, false, true), Nav::Dolly);
+        // Option+Cmd+LMB pans, as on Maya for macOS.
+        assert_eq!(maya_nav(true, true, true, false, false), Nav::Pan);
+        // Cmd (Ctrl off macOS) alone drives the camera as well, for window
+        // managers that keep Alt+drag for themselves.
+        assert_eq!(maya_nav(false, true, true, false, false), Nav::Tumble);
+        assert_eq!(maya_nav(false, true, false, true, false), Nav::Pan);
+        assert_eq!(maya_nav(false, true, false, false, true), Nav::Dolly);
+        // Without a modifier the viewport drag belongs to the gizmo.
+        assert_eq!(maya_nav(false, false, true, false, false), Nav::None);
+        assert_eq!(maya_nav(false, false, false, true, false), Nav::None);
+        // A modifier on its own does nothing.
+        assert_eq!(maya_nav(true, false, false, false, false), Nav::None);
     }
 }
 

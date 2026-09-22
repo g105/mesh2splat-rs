@@ -3,8 +3,11 @@
 use std::time::{Duration, Instant};
 
 use super::merge::GpuMerger;
-use super::scene::{mesh_bind_group_layout, GpuScene};
-use super::{pipeline_layout, shader_with_common, storage_entry, GaussianBuffer, GpuContext};
+use super::scene::{detail_bind_group_layout, mesh_bind_group_layout, GpuScene};
+use super::{
+    compute_pipeline, dispatch_dims, pipeline_layout, shader_with_common, storage_entry,
+    GaussianBuffer, GpuContext,
+};
 use crate::merge::{self, GridInfo, MergeSettings, MergeStats};
 use crate::types::{GaussianVertex, SourceFormat, MAX_GAUSSIANS};
 use wgpu::util::DeviceExt;
@@ -27,6 +30,35 @@ pub struct ConvertSettings {
     pub bbox_mode: BBoxMode,
     /// Merge alike neighbouring splats into larger ones after conversion.
     pub merge: Option<MergeSettings>,
+    /// Give triangles with little texture detail a coarser sampling grid.
+    pub detail: Option<DetailSettings>,
+}
+
+/// Detail-aware sampling density.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DetailSettings {
+    /// Largest material difference (0..1) a coarser level may introduce.
+    pub tolerance: f32,
+    /// Coarsest level, as a power of two: 1 = half density, 3 = an eighth.
+    pub max_level: u32,
+}
+
+impl Default for DetailSettings {
+    fn default() -> Self {
+        Self::from_strength(Self::DEFAULT_STRENGTH)
+    }
+}
+
+impl DetailSettings {
+    pub const DEFAULT_STRENGTH: f32 = 0.25;
+
+    /// One-knob preset: 0 = only perfectly flat material, 1 = aggressive.
+    pub fn from_strength(strength: f32) -> Self {
+        Self {
+            tolerance: 0.1 * strength.clamp(0.0, 1.0),
+            max_level: 3,
+        }
+    }
 }
 
 impl Default for ConvertSettings {
@@ -36,6 +68,7 @@ impl Default for ConvertSettings {
             resolution: resolution_from_quality(0.5, 1024),
             bbox_mode: BBoxMode::Scene,
             merge: None,
+            detail: None,
         }
     }
 }
@@ -62,12 +95,18 @@ pub struct Converter {
     pub gpu_merge: bool,
     merger: Option<GpuMerger>,
     pipeline: wgpu::RenderPipeline,
+    detail_pipeline: wgpu::ComputePipeline,
+    pass_levels: Vec<wgpu::Buffer>,
     output_bgl: wgpu::BindGroupLayout,
     counter: wgpu::Buffer,
-    target: Option<(u32, wgpu::TextureView)>,
+    /// Render targets by level: `targets[l]` has side `resolution >> l`.
+    targets: Option<(u32, Vec<wgpu::TextureView>)>,
 }
 
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+
+/// Coarsest sampling level the converter can draw (1/8 density).
+pub const MAX_DETAIL_LEVEL: u32 = 3;
 
 impl Converter {
     pub fn new(ctx: &GpuContext) -> Self {
@@ -79,6 +118,7 @@ impl Converter {
             entries: &[
                 storage_entry(0, wgpu::ShaderStages::FRAGMENT, false),
                 storage_entry(1, wgpu::ShaderStages::FRAGMENT, false),
+                super::uniform_entry(2, wgpu::ShaderStages::VERTEX_FRAGMENT),
             ],
         });
         let mesh_bgl = mesh_bind_group_layout(device);
@@ -112,6 +152,23 @@ impl Converter {
             multiview_mask: None,
             cache: None,
         });
+        let detail_module =
+            shader_with_common(device, "detail.wgsl", include_str!("shaders/detail.wgsl"));
+        let detail_bgl = detail_bind_group_layout(device);
+        let detail_pipeline =
+            compute_pipeline(device, "detail", &[&detail_bgl], &detail_module, "main");
+        // One tiny uniform per sampling level; a single buffer rewritten
+        // between passes would not work, as queue writes land before the
+        // whole command buffer.
+        let pass_levels = (0..=MAX_DETAIL_LEVEL)
+            .map(|l| {
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("convert pass level"),
+                    contents: bytemuck::cast_slice(&[l, 0u32, 0, 0]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                })
+            })
+            .collect();
         let counter = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("convert counter"),
             size: 4,
@@ -124,9 +181,11 @@ impl Converter {
             gpu_merge: true,
             merger: None,
             pipeline,
+            detail_pipeline,
+            pass_levels,
             output_bgl,
             counter,
-            target: None,
+            targets: None,
         }
     }
 
@@ -164,55 +223,103 @@ impl Converter {
             };
             // .w carries the mesh index into the gaussians (see convert.wgsl).
             p.bbox_min = bbox.min.extend(mesh_index as f32).to_array();
+            p.detail = [
+                0,
+                mesh.triangle_count,
+                settings.detail.map_or(0, |d| d.max_level.min(MAX_DETAIL_LEVEL)),
+                settings.detail.is_some() as u32,
+            ];
+            p.detail_tol = [
+                settings.detail.map_or(0.0, |d| d.tolerance),
+                res as f32,
+                0.0,
+                0.0,
+            ];
             p.bbox_max = bbox.max.extend(0.0).to_array();
             p.flags[3] = capacity;
             ctx.queue
                 .write_buffer(&mesh.params_buffer, 0, bytemuck::bytes_of(&p));
         }
 
-        if self.target.as_ref().map(|t| t.0) != Some(res) {
-            let tex = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("convert target"),
-                size: wgpu::Extent3d {
-                    width: res,
-                    height: res,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: TARGET_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            });
-            self.target = Some((res, tex.create_view(&Default::default())));
+        let levels = settings
+            .detail
+            .map_or(1, |d| d.max_level.min(MAX_DETAIL_LEVEL) + 1);
+        if self.targets.as_ref().map(|t| t.0) != Some(res)
+            || self.targets.as_ref().is_some_and(|t| t.1.len() < levels as usize)
+        {
+            // One target per level; level l lands on every 2^l-th grid cell.
+            let views = (0..levels)
+                .map(|l| {
+                    let side = (res >> l).max(1);
+                    let tex = device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("convert target"),
+                        size: wgpu::Extent3d {
+                            width: side,
+                            height: side,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: TARGET_FORMAT,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        view_formats: &[],
+                    });
+                    tex.create_view(&Default::default())
+                })
+                .collect();
+            self.targets = Some((res, views));
         }
-        let target = &self.target.as_ref().unwrap().1;
+        let targets = &self.targets.as_ref().unwrap().1;
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("convert output"),
-            layout: &self.output_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: out.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.counter.as_entire_binding(),
-                },
-            ],
-        });
+        let bind_groups: Vec<wgpu::BindGroup> = (0..levels)
+            .map(|level| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("convert output"),
+                    layout: &self.output_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: out.buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.counter.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.pass_levels[level as usize].as_entire_binding(),
+                        },
+                    ],
+                })
+            })
+            .collect();
 
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("convert"),
         });
         enc.clear_buffer(&self.counter, 0, None);
-        {
+        // Pick each triangle's sampling level from its material detail.
+        if settings.detail.is_some() {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("detail"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.detail_pipeline);
+            for mesh in &scene.meshes {
+                if mesh.triangle_count == 0 {
+                    continue;
+                }
+                let (x, y) = dispatch_dims(mesh.triangle_count.div_ceil(64));
+                pass.set_bind_group(0, &mesh.detail_bind_group, &[]);
+                pass.dispatch_workgroups(x, y, 1);
+            }
+        }
+        for level in 0..levels {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("convert"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
+                    view: &targets[level as usize],
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -226,14 +333,13 @@ impl Converter {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, &bind_groups[level as usize], &[]);
             for mesh in &scene.meshes {
                 pass.set_bind_group(1, &mesh.bind_group, &[]);
                 pass.draw(0..mesh.vertex_count, 0..1);
             }
         }
         ctx.queue.submit([enc.finish()]);
-
         let fragments =
             u32::from_le_bytes(ctx.read_buffer(&self.counter, 0, 4).try_into().unwrap());
         let count = fragments.min(capacity);

@@ -54,14 +54,15 @@ mesh2splat                       # or: mesh2splat gui path/to/model.glb
 The side panel mirrors the original's ImGui windows:
 
 * **Input** — pick or drop a `.glb`, `.gltf` or `.ply` file.
-* **Output** — choose the output folder, file name and format (Standard / PBR / Compressed PBR), then press **Save splat**.
+* **Output** — choose the output folder, file name and format (Standard / Standard SH0 / PBR / Compressed PBR), then press **Save splat**. *Standard SH0* leaves out the 45 higher-order SH coefficients, which are always zero for converted meshes, so files are about 3.6x smaller.
 * **Properties** — visualization mode (Final, Albedo, Depth, Normals, Geometry, Overdraw, PBR), mesh/gaussian depth test, gaussian scale, sampling density (16 up to 1024/2048/4096 px), projection box, background color and split-screen.
 * **Lighting** — point light with intensity, color and a cube shadow map.
+* **Camera** — switch between the original fly controls and Maya-style controls, and frame the model.
 * **Gizmo** — translate, rotate or scale the model or the light (local or world axes).
 * **Batch conversion** — pick a folder of meshes, optionally including subfolders, and convert them all.
-* **Stats** — gaussian counts, conversion time, and a GPU frame-time graph (the graph needs timestamp query support).
+* **Stats** — gaussian counts, conversion time, a GPU frame-time graph and a prepass / sort / splat raster breakdown (these need timestamp query support). The viewport only re-renders when the view or settings change; tick **Continuous redraw** to profile.
 
-Camera controls are the same as the original:
+Camera controls default to the original fly camera:
 
 | Input | Action |
 |---|---|
@@ -71,6 +72,16 @@ Camera controls are the same as the original:
 | `R` / `T` | Roll |
 | `Shift` / `Ctrl` | Fast / slow |
 | Mouse wheel | Field of view |
+| `F` | Frame the model |
+
+Select **Maya** in the **Camera** section for Maya-style navigation around a pivot:
+
+| Input | Action |
+|---|---|
+| `Alt` + left drag | Tumble |
+| `Alt` + middle drag, or `Alt` + `Cmd` + left drag (`Alt` + `Ctrl` off macOS) | Pan |
+| `Alt` + right drag, mouse wheel, or trackpad pinch | Dolly |
+| `F` | Frame the model, keeping the view direction |
 
 ### CLI
 
@@ -78,6 +89,9 @@ Camera controls are the same as the original:
 # single file
 mesh2splat convert model.glb -o model.ply --quality 0.5 --format standard
 mesh2splat convert model.glb --resolution 2048 --format pbr --std 0.65
+
+# SH0-only standard layout (much smaller, same visual result for converted meshes)
+mesh2splat convert model.glb -o model.ply --format sh0
 
 # batch (like the original's batch window)
 mesh2splat convert --batch ./meshes -o ./splats --recursive --format compressed
@@ -91,6 +105,15 @@ mesh2splat render scene.ply  -o ply.png --mode albedo
 
 `--quality q` maps to `resolution = 16 + q * (max_res - 16)`, the same as the UI slider. The
 defaults (`q = 0.5`, `max_res = 1024`, giving 520 px, and `std = 0.65`) match the original.
+
+### Benchmark
+
+```bash
+cargo run --release --example bench -- assets/DamagedHelmet.glb --res 520,1024 --size 1920x1080
+cargo run --release --example bench -- --baseline target/bench/baseline   # also print PSNR vs saved PNGs
+```
+
+For each sampling resolution this converts the model, renders five views and prints the splat count, median GPU time for prepass, sort and splat raster, and the PLY size of every export format.
 
 ### Library
 
@@ -111,7 +134,7 @@ ply::write_ply("model.ply", &gaussians.download(&ctx), PlyFormat::Standard, gaus
 src/
   scene.rs          glTF loading (node transforms baked, normals/tangents like the original)
   ply.rs            PLY writer (3 layouts) and reader (standard / PBR / compressed)
-  camera.rs         fly camera (port of Camera.cpp)
+  camera.rs         fly camera (port of Camera.cpp) + Maya tumble / pan / dolly
   cli.rs, main.rs   clap CLI
   app.rs            eframe/egui UI (port of ImGuiUI + GuiRendererConcreteMediator)
   gpu/

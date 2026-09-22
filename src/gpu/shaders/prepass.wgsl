@@ -75,6 +75,17 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>, @builtin(num_workgroups)
         color = vec4<f32>(random2d(c), random2d(c.yx), random2d(c.yx * 1.234), 1.0);
     }
 
+    // Beyond sqrt(2 ln(255 a)) sigma a splat contributes less than 1/255, so
+    // faint splats get smaller quads (capped at the original 3 sigma).
+    let alpha = color.a;
+    if (alpha < 1.0 / 255.0) {
+        return;
+    }
+    let k = min(1.0, sqrt(2.0 * log(255.0 * alpha)) / 3.0);
+    if (k <= 0.0) {
+        return;
+    }
+
     let p = project_cov(cov3d, frame.world_to_view, frame.view_to_clip, vs.xyz, frame.resolution);
     if (!p.ok) {
         return;
@@ -85,15 +96,21 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>, @builtin(num_workgroups)
         return;
     }
     var q: Quad;
-    q.mean_ndc = vec4<f32>(clip_pos.xyz / clip_pos.w, 1.0);
-    q.axes_ndc = p.axes;
-    q.color = color;
-    q.conic = vec4<f32>(p.conic, -vs.z);
-    q.normal = vec4<f32>(normal_ws.xyz, g.pbr.x);
-    q.ws_pos = vec4<f32>(ws.xyz, g.pbr.y);
+    q.mean_ndc = clip_pos.xy / clip_pos.w;
+    q.axes_ndc = vec2<u32>(pack2x16float(p.axes.xy * k), pack2x16float(p.axes.zw * k));
+    q.ws_pos = ws.xyz;
+    q.extent = pack2x16float(p.extent * k);
+    q.color = pack4x8unorm(color);
+    q.normal = pack2x16unorm(oct_encode(normalize(decode_normal(normal_ws.xyz))));
+    q.metal_rough = pack4x8unorm(vec4<f32>(g.pbr.xy, 0.0, 0.0));
+    q._pad = 0u;
     quads[idx] = q;
-    // Negative view z: larger magnitude => larger bit pattern, so ascending
-    // u32 order is front-to-back.
-    keys[idx] = bitcast<u32>(vs.z);
+    if (frame.sort_scale > 0.0) {
+        keys[idx] = u32(clamp((-vs.z - frame.sort_min) * frame.sort_scale, 0.0, 65535.0));
+    } else {
+        // Negative view z: larger magnitude => larger bit pattern, so ascending
+        // u32 order is front-to-back.
+        keys[idx] = bitcast<u32>(vs.z);
+    }
     vals[idx] = idx;
 }

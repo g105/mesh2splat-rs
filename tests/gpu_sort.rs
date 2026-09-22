@@ -31,7 +31,8 @@ fn check(ctx: &GpuContext, sorter: &mut RadixSorter, n: usize, key_mask: u32, se
             .write_buffer(&sorter.vals[0], 0, bytemuck::cast_slice(&vals));
     }
     let mut enc = ctx.device.create_command_encoder(&Default::default());
-    sorter.encode(&mut enc);
+    // Only sort the bits the keys use, like the renderer does for 16-bit depth keys.
+    sorter.encode(&mut enc, 32 - key_mask.leading_zeros());
     ctx.queue.submit([enc.finish()]);
 
     let info = ctx.read_buffer(&sorter.info, 0, 4);
@@ -56,7 +57,7 @@ fn check(ctx: &GpuContext, sorter: &mut RadixSorter, n: usize, key_mask: u32, se
     // args: dispatch x = blocks, draw instance count = n
     let args: Vec<u32> = bytemuck::cast_slice(&ctx.read_buffer(&sorter.args, 0, 28)).to_vec();
     assert_eq!(args[0] as usize, n.div_ceil(2048));
-    assert_eq!(args[3], 6);
+    assert_eq!(args[3], 4); // one 4-vertex triangle strip per splat
     assert_eq!(args[4] as usize, n);
 }
 
@@ -86,6 +87,9 @@ fn radix_sort_matches_cpu() {
     }
     // Many duplicates -> exercises stability.
     check(&ctx, &mut sorter, 50_000, 0xF, 7);
+    // 16-bit keys (quantized depth): 4 passes instead of 8.
+    check(&ctx, &mut sorter, 1_000_000, 0xFFFF, 3);
+    check(&ctx, &mut sorter, 2049, 0xFFFF, 5);
     // Float-bit keys of negative depths (what the renderer sorts).
     let n = 30_000;
     let mut s = 11u64;

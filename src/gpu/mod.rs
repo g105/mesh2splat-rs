@@ -12,10 +12,10 @@ use anyhow::{Context, Result};
 use wgpu::util::DeviceExt;
 
 pub use converter::{BBoxMode, ConvertSettings, Converter};
-pub use renderer::{RenderSettings, Renderer};
+pub use renderer::{FrameStats, RenderSettings, Renderer, StageTimes};
 pub use scene::GpuScene;
 
-use crate::types::{GaussianVertex, SourceFormat, MAX_GAUSSIANS};
+use crate::types::{BBox, GaussianVertex, SourceFormat, MAX_GAUSSIANS};
 
 /// Device + queue pair used by all GPU code.
 #[derive(Clone)]
@@ -146,6 +146,9 @@ pub struct GaussianBuffer {
     pub resolution: u32,
     /// Bumped whenever the contents change, so dependent resources can react.
     pub generation: u64,
+    /// Model-space bounds of the gaussian centers (lets the renderer sort on
+    /// 16-bit depth keys; [`BBox::EMPTY`] falls back to full 32-bit keys).
+    pub bounds: BBox,
 }
 
 impl GaussianBuffer {
@@ -167,6 +170,7 @@ impl GaussianBuffer {
             ply_has_pbr: false,
             resolution: 1,
             generation: 0,
+            bounds: BBox::EMPTY,
         }
     }
 
@@ -214,6 +218,10 @@ impl GaussianBuffer {
         self.ply_has_pbr = has_pbr;
         self.resolution = 1;
         self.generation += 1;
+        self.bounds = BBox::EMPTY;
+        for g in gaussians {
+            self.bounds.grow(glam::Vec3::from_slice(&g.position[..3]));
+        }
     }
 
     /// Download the valid gaussians.

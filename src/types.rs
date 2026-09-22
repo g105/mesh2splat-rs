@@ -54,6 +54,9 @@ pub enum PlyFormat {
     /// Standard 3DGS layout (positions, normals, f_dc, 45 x f_rest, opacity, scale, rot).
     #[default]
     Standard,
+    /// Standard layout without the 45 `f_rest` coefficients (always zero for
+    /// converted meshes): ~3.6x smaller and still read by common 3DGS viewers.
+    StandardSh0,
     /// Standard layout minus SH rest, plus metallic / roughness.
     Pbr,
     /// Quantised layout with 8-bit color, octahedral normals and 8-bit PBR.
@@ -61,8 +64,9 @@ pub enum PlyFormat {
 }
 
 impl PlyFormat {
-    pub const ALL: [PlyFormat; 3] = [
+    pub const ALL: [PlyFormat; 4] = [
         PlyFormat::Standard,
+        PlyFormat::StandardSh0,
         PlyFormat::Pbr,
         PlyFormat::CompressedPbr,
     ];
@@ -70,6 +74,7 @@ impl PlyFormat {
     pub fn label(self) -> &'static str {
         match self {
             PlyFormat::Standard => "PLY Standard Format",
+            PlyFormat::StandardSh0 => "PLY Standard, SH0 only (smaller)",
             PlyFormat::Pbr => "PLY PBR",
             PlyFormat::CompressedPbr => "PLY Compressed PBR",
         }

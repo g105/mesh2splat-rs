@@ -23,15 +23,41 @@ struct MeshParams {
     flags: vec4<u32>, // has albedo, has normal, has metallic-roughness, max gaussians
 };
 
-// Per-visible-splat data produced by the prepass (QuadNdcTransformation).
+// Per-visible-splat data produced by the prepass (QuadNdcTransformation),
+// packed to 48 bytes: the splat vertex shader gathers it in sorted order, so
+// its size is what the vertex stage pays for.
 struct Quad {
-    mean_ndc: vec4<f32>,   // xy = NDC center
-    axes_ndc: vec4<f32>,   // xy = major axis, zw = minor axis (NDC)
-    color: vec4<f32>,
-    conic: vec4<f32>,      // xyz = inverse 2D covariance (a, b, c), w = view depth
-    normal: vec4<f32>,     // xyz = encoded normal, w = metallic
-    ws_pos: vec4<f32>,     // xyz = world position, w = roughness
+    mean_ndc: vec2<f32>,
+    axes_ndc: vec2<u32>,   // pack2x16float of the major / minor half-axis (NDC)
+    ws_pos: vec3<f32>,     // world position
+    extent: u32,           // pack2x16float: half-axis lengths in standard deviations
+    color: u32,            // pack4x8unorm rgba (a = opacity)
+    normal: u32,           // pack2x16unorm of the octahedral world normal
+    metal_rough: u32,      // pack4x8unorm (metallic, roughness, 0, 0)
+    _pad: u32,
 };
+
+fn oct_wrap(v: vec2<f32>) -> vec2<f32> {
+    return (1.0 - abs(v.yx)) * select(vec2<f32>(-1.0), vec2<f32>(1.0), v >= vec2<f32>(0.0));
+}
+
+// Unit vector -> [0, 1]^2 (octahedral mapping).
+fn oct_encode(n: vec3<f32>) -> vec2<f32> {
+    var p = n.xy / max(abs(n.x) + abs(n.y) + abs(n.z), 1e-20);
+    if (n.z < 0.0) {
+        p = oct_wrap(p);
+    }
+    return p * 0.5 + 0.5;
+}
+
+fn oct_decode(e: vec2<f32>) -> vec3<f32> {
+    let f = e * 2.0 - 1.0;
+    var n = vec3<f32>(f, 1.0 - abs(f.x) - abs(f.y));
+    if (n.z < 0.0) {
+        n = vec3<f32>(oct_wrap(n.xy), n.z);
+    }
+    return normalize(n);
+}
 
 fn random2d(co: vec2<f32>) -> f32 {
     let dt = dot(co, vec2<f32>(12.9898, 78.233));
@@ -90,6 +116,8 @@ struct Projected {
     ok: bool,
     axes: vec4<f32>,
     conic: vec3<f32>,
+    // Half-axis lengths in standard deviations (3, unless clamped to 1024 px).
+    extent: vec2<f32>,
 };
 
 fn project_cov(cov3d: mat3x3<f32>, view: mat4x4<f32>, proj: mat4x4<f32>, p_view: vec3<f32>, resolution: vec2<f32>) -> Projected {
@@ -133,8 +161,10 @@ fn project_cov(cov3d: mat3x3<f32>, view: mat4x4<f32>, proj: mat4x4<f32>, p_view:
     } else {
         diag = vec2<f32>(0.0, 1.0);
     }
-    let major = min(3.0 * sqrt(l1), 1024.0) * diag;
-    let minor = min(3.0 * sqrt(l2), 1024.0) * vec2<f32>(diag.y, -diag.x);
+    let len = min(3.0 * sqrt(vec2<f32>(l1, l2)), vec2<f32>(1024.0));
+    out.extent = len / sqrt(vec2<f32>(l1, l2));
+    let major = len.x * diag;
+    let minor = len.y * vec2<f32>(diag.y, -diag.x);
     let half_res = resolution * 0.5;
     out.axes = vec4<f32>(major / half_res, minor / half_res);
     let inv = inverse_mat2(mat2x2<f32>(c00, c01, c01, c11));

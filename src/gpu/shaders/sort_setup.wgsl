@@ -21,8 +21,8 @@ fn setup() {
     setup_args[0] = (n + 2047u) / 2048u; // must match BLOCK in sort.wgsl
     setup_args[1] = 1u;
     setup_args[2] = 1u;
-    // draw_indirect args for the splat pass: 6 vertices per splat quad
-    setup_args[3] = 6u;
+    // draw_indirect args for the splat pass: one 4-vertex triangle strip per splat
+    setup_args[3] = 4u;
     setup_args[4] = n;
     setup_args[5] = 0u;
     setup_args[6] = 0u;

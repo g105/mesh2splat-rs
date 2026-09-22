@@ -14,6 +14,8 @@ struct Frame {
     format: u32,       // 0 = converted mesh, 1 = loaded ply
     ply_has_pbr: u32,
     depth_test: u32,
-    _pad0: u32,
-    _pad1: u32,
+    // View depth -> 16-bit sort key: (depth - sort_min) * sort_scale.
+    // sort_scale == 0 means sort on the raw 32-bit float depth.
+    sort_min: f32,
+    sort_scale: f32,
 };

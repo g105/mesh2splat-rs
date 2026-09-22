@@ -42,6 +42,8 @@ pub enum Command {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum FormatArg {
     Standard,
+    /// Standard without the (all-zero) higher-order SH coefficients.
+    Sh0,
     Pbr,
     Compressed,
 }
@@ -50,6 +52,7 @@ impl From<FormatArg> for PlyFormat {
     fn from(f: FormatArg) -> Self {
         match f {
             FormatArg::Standard => PlyFormat::Standard,
+            FormatArg::Sh0 => PlyFormat::StandardSh0,
             FormatArg::Pbr => PlyFormat::Pbr,
             FormatArg::Compressed => PlyFormat::CompressedPbr,
         }

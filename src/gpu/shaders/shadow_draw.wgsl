@@ -26,15 +26,13 @@ struct VsOut {
 
 @vertex
 fn vs_main(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VsOut {
-    var corners = array<vec2<f32>, 6>(
-        vec2<f32>(-1.0, -1.0), vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, 1.0),
-        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(1.0, -1.0));
     var offset = 0u;
     for (var f = 0u; f < dp.face; f++) {
         offset += face_counts[f];
     }
     let q = squads[face_list[offset + iid]];
-    let c = corners[vid];
+    // Triangle strip (-1,-1) (1,-1) (-1,1) (1,1).
+    let c = vec2<f32>(f32(vid & 1u), f32(vid >> 1u)) * 2.0 - 1.0;
     var out: VsOut;
     out.pos = vec4<f32>(q.mean_ndc.xy + c.x * q.axes_ndc.xy + c.y * q.axes_ndc.zw, 0.0, 1.0);
     out.ws_pos = q.ws_pos.xyz;

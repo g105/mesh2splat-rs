@@ -199,6 +199,25 @@ pub struct App {
     last_frame: Instant,
     status: Option<Status>,
     prev_mode_before_lighting: RenderMode,
+
+    // redraw on demand
+    /// Inputs of the last rendered frame; the splats are only re-rendered when these change.
+    last_render: Option<RenderKey>,
+    /// UI frames left to repaint after a render, so the async GPU stats land.
+    settle_frames: u32,
+    /// Render every frame even when nothing changed (for profiling).
+    continuous_redraw: bool,
+}
+
+/// Everything a rendered frame depends on.
+#[derive(PartialEq)]
+struct RenderKey {
+    view: Mat4,
+    fov: f32,
+    size: (u32, u32),
+    settings: RenderSettings,
+    generation: u64,
+    count: u32,
 }
 
 impl App {
@@ -253,6 +272,9 @@ impl App {
             last_frame: Instant::now(),
             status: None,
             prev_mode_before_lighting: RenderMode::Final,
+            last_render: None,
+            settle_frames: 0,
+            continuous_redraw: false,
         };
         if let Some(f) = file {
             app.open(f, &cc.egui_ctx);
@@ -815,6 +837,12 @@ impl App {
             "Frame time"
         };
         ui.label(format!("{label}: {latest:.3} ms"));
+        if let Some(st) = stats.stages {
+            ui.small(format!(
+                "prepass {:.2} · sort {:.2} · splat raster {:.2} ms",
+                st.prepass, st.sort, st.splat
+            ));
+        }
         ui.small(format!(
             "{} ({:?})",
             self.ctx.adapter_info.name, self.ctx.adapter_info.backend
@@ -850,6 +878,8 @@ impl App {
                 Stroke::new(1.0, Color32::from_rgb(100, 200, 255)),
             ));
         }
+        ui.checkbox(&mut self.continuous_redraw, "Continuous redraw")
+            .on_hover_text("Re-render every frame even when nothing changed (for profiling). Off: the splats are only redrawn when the view or settings change.");
         ui.add(egui::Slider::new(&mut self.plot_max_ms, 16.6..=100.0).text("Max scale (ms)"));
         ui.add(egui::Slider::new(&mut self.plot_target_ms, 8.3..=50.0).text("Target line (ms)"));
     }
@@ -967,7 +997,8 @@ impl App {
         let rect = ui.max_rect();
         let response = ui.allocate_rect(rect, Sense::click_and_drag());
         let now = Instant::now();
-        let dt = (now - self.last_frame).as_secs_f32().min(0.1);
+        // UI frames only run on demand, so cap the step after an idle period.
+        let dt = (now - self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
         self.camera_input(ui, &response, dt);
 
@@ -977,34 +1008,47 @@ impl App {
             (rect.height() * ppp).round().max(1.0) as u32,
         );
 
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("frame"),
-            });
-        self.renderer.render(
-            &self.ctx,
-            &mut enc,
-            &self.camera,
-            &self.settings,
-            &self.gaussians,
-            self.scene.as_ref(),
+        let key = RenderKey {
+            view: self.camera.view_matrix(),
+            fov: self.camera.fov,
             size,
-        );
-        self.ctx.queue.submit([enc.finish()]);
-        self.renderer.after_submit(&self.ctx);
+            settings: self.settings.clone(),
+            generation: self.gaussians.generation,
+            count: self.gaussians.count,
+        };
+        if self.continuous_redraw || self.last_render.as_ref() != Some(&key) {
+            let mut enc = self
+                .ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("frame"),
+                });
+            self.renderer.render(
+                &self.ctx,
+                &mut enc,
+                &self.camera,
+                &self.settings,
+                &self.gaussians,
+                self.scene.as_ref(),
+                size,
+            );
+            self.ctx.queue.submit([enc.finish()]);
+            self.last_render = Some(key);
+            self.settle_frames = 3;
 
-        let ms = self
-            .renderer
-            .stats()
-            .gpu_ms
-            .map(|v| v as f32)
-            .unwrap_or(dt * 1000.0);
-        if self.frame_times.len() >= 300 {
-            self.frame_times.pop_front();
+            let ms = self
+                .renderer
+                .stats()
+                .gpu_ms
+                .map(|v| v as f32)
+                .unwrap_or(dt * 1000.0);
+            if self.frame_times.len() >= 300 {
+                self.frame_times.pop_front();
+            }
+            self.frame_times.push_back(ms);
         }
-        self.frame_times.push_back(ms);
+        // Non-blocking: collects the GPU stats of earlier frames.
+        self.renderer.after_submit(&self.ctx);
 
         // Hand the output texture to egui.
         if let (Some(rs), Some((_, view))) = (frame.wgpu_render_state(), self.renderer.output()) {
@@ -1125,6 +1169,30 @@ impl App {
     }
 }
 
+impl App {
+    /// egui repaints on input by itself; this keeps frames coming only while
+    /// something is animating, so an idle viewport costs no GPU time.
+    fn schedule_repaint(&mut self, ctx: &egui::Context) {
+        let fly_keys_held = self.camera_controls == CameraControls::Fly
+            && !ctx.egui_wants_keyboard_input()
+            && ctx.input(|i| {
+                use egui::Key::*;
+                [W, A, S, D, Q, E, R, T].iter().any(|k| i.key_down(*k))
+            });
+        let busy = self.loading.is_some() || self.batch_running || self.needs_conversion;
+        if self.continuous_redraw || busy || fly_keys_held || self.settle_frames > 0 {
+            self.settle_frames = self.settle_frames.saturating_sub(1);
+            ctx.request_repaint();
+        } else if let Some(s) = &self.status {
+            // Repaint once more when the status message should disappear.
+            let left = 6.0 - s.at.elapsed().as_secs_f32();
+            if left > 0.0 {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f32(left));
+            }
+        }
+    }
+}
+
 fn fmt_thousands(v: u64) -> String {
     let s = v.to_string();
     let mut out = String::new();
@@ -1170,6 +1238,6 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show_inside(ui, |ui| self.viewport(ui, frame));
-        egui_ctx.request_repaint();
+        self.schedule_repaint(&egui_ctx);
     }
 }

@@ -28,7 +28,7 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// Everything the UI can tweak that affects a frame.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RenderSettings {
     pub render_mode: RenderMode,
     /// "Gaussian Scale" slider (standard deviation multiplier for converted meshes).
@@ -72,7 +72,29 @@ pub struct FrameStats {
     pub visible_gaussians: u32,
     /// GPU time of the last completed frame (needs `TIMESTAMP_QUERY`).
     pub gpu_ms: Option<f64>,
+    /// Per-stage GPU times of the splat path (needs `TIMESTAMP_QUERY` and a non-empty frame).
+    pub stages: Option<StageTimes>,
 }
+
+/// GPU milliseconds spent in the main splat stages of one frame.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StageTimes {
+    /// Projection, culling and 2D covariance.
+    pub prepass: f64,
+    /// Radix sort (including the indirect-args setup).
+    pub sort: f64,
+    /// Splat rasterization into the G-buffer.
+    pub splat: f64,
+}
+
+// Timestamp query slots.
+const TS_FRAME_BEGIN: u32 = 0;
+const TS_FRAME_END: u32 = 1;
+const TS_PREPASS_BEGIN: u32 = 2;
+const TS_PREPASS_END: u32 = 3;
+const TS_SPLAT_BEGIN: u32 = 4;
+const TS_SPLAT_END: u32 = 5;
+const TS_COUNT: u32 = 6;
 
 // --- uniforms --------------------------------------------------------------
 
@@ -93,7 +115,8 @@ struct FrameUniform {
     format: u32,
     ply_has_pbr: u32,
     depth_test: u32,
-    _pad: [u32; 2],
+    sort_min: f32,
+    sort_scale: f32,
 }
 
 #[repr(C)]
@@ -261,6 +284,9 @@ struct StatsReadback {
     ready: Arc<AtomicBool>,
     period: f32,
     last: FrameStats,
+    /// Slot holding the prepass start of the copied frame (the frame-begin slot
+    /// when the prepass was the first pass), or `None` if no prepass ran.
+    prepass_begin_slot: Option<u32>,
 }
 
 pub struct Renderer {
@@ -352,6 +378,30 @@ fn m4(m: Mat4) -> [[f32; 4]; 4] {
 }
 
 /// View matrices of the six cube faces (same orientation as the original).
+/// View-depth range of the gaussians' bounds, as `(min, 65535 / (max - min))`
+/// for 16-bit sort keys. Returns a zero scale (sort on 32-bit float depth)
+/// when the bounds are unknown.
+fn sort_depth_range(gaussians: &GaussianBuffer, model_view: Mat4) -> (f32, f32) {
+    let b = gaussians.bounds;
+    if !b.is_valid() {
+        return (0.0, 0.0);
+    }
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for i in 0..8 {
+        let corner = Vec3::new(
+            if i & 1 == 0 { b.min.x } else { b.max.x },
+            if i & 2 == 0 { b.min.y } else { b.max.y },
+            if i & 4 == 0 { b.min.z } else { b.max.z },
+        );
+        let depth = -model_view.transform_point3(corner).z;
+        lo = lo.min(depth);
+        hi = hi.max(depth);
+    }
+    let lo = lo.max(NEAR_PLANE);
+    let hi = hi.max(lo + 1e-6);
+    (lo, 65535.0 / (hi - lo))
+}
+
 pub fn cube_face_views(light: Vec3) -> [Mat4; 6] {
     [
         Mat4::look_at_rh(light, light + Vec3::X, -Vec3::Y),
@@ -478,7 +528,9 @@ impl Renderer {
                     compilation_options: Default::default(),
                     buffers: &[],
                 },
+                // One 4-vertex strip per splat: a third fewer vertex invocations than a triangle list.
                 primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
                     cull_mode: None,
                     ..Default::default()
                 },
@@ -603,6 +655,7 @@ impl Renderer {
                 buffers: &[],
             },
             primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
                 cull_mode: None,
                 ..Default::default()
             },
@@ -739,11 +792,11 @@ impl Renderer {
                 Some(device.create_query_set(&wgpu::QuerySetDescriptor {
                     label: Some("timestamps"),
                     ty: wgpu::QueryType::Timestamp,
-                    count: 2,
+                    count: TS_COUNT,
                 })),
                 Some(device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("timestamp resolve"),
-                    size: 16,
+                    size: TS_COUNT as u64 * 8,
                     usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
                     mapped_at_creation: false,
                 })),
@@ -756,7 +809,7 @@ impl Renderer {
             resolve,
             buffer: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("stats readback"),
-                size: 32,
+                size: TS_COUNT as u64 * 8 + 16,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             }),
@@ -764,6 +817,7 @@ impl Renderer {
             ready: Arc::new(AtomicBool::new(false)),
             period: ctx.queue.get_timestamp_period(),
             last: FrameStats::default(),
+            prepass_begin_slot: None,
         };
 
         Self {
@@ -849,7 +903,7 @@ impl Renderer {
                 capacity,
                 quads: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("quads"),
-                    size: capacity as u64 * 96,
+                    size: capacity as u64 * 48,
                     usage: wgpu::BufferUsages::STORAGE,
                     mapped_at_creation: false,
                 }),
@@ -1016,6 +1070,8 @@ impl Renderer {
         let model_scale = [c0, c0, c1, 0.0]; // same (quirky) choice of columns as the original
         let std_dev = gaussians.scale_multiplier(settings.gaussian_std);
         let format = gaussians.format as u32;
+        let (sort_min, sort_scale) = sort_depth_range(gaussians, view * model);
+        let key_bits = if sort_scale > 0.0 { 16 } else { 32 };
 
         let frame = FrameUniform {
             world_to_view: m4(view),
@@ -1032,7 +1088,8 @@ impl Renderer {
             format,
             ply_has_pbr: gaussians.ply_has_pbr as u32,
             depth_test: depth_test as u32,
-            _pad: [0; 2],
+            sort_min,
+            sort_scale,
         };
         ctx.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
@@ -1169,14 +1226,17 @@ impl Renderer {
 
         // --- 3/4. gaussian prepass + sort
         enc.clear_buffer(&self.counters, 0, None);
+        let mut prepass_begin_slot = None;
         if count > 0 {
-            let ts = qs
-                .filter(|_| begin_ts())
-                .map(|q| wgpu::ComputePassTimestampWrites {
+            let ts = qs.map(|q| {
+                let slot = if begin_ts() { TS_FRAME_BEGIN } else { TS_PREPASS_BEGIN };
+                prepass_begin_slot = Some(slot);
+                wgpu::ComputePassTimestampWrites {
                     query_set: q,
-                    beginning_of_pass_write_index: Some(0),
-                    end_of_pass_write_index: None,
-                });
+                    beginning_of_pass_write_index: Some(slot),
+                    end_of_pass_write_index: Some(TS_PREPASS_END),
+                }
+            });
             {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("gaussian prepass"),
@@ -1187,18 +1247,22 @@ impl Renderer {
                 let (x, y) = dispatch_dims(count.div_ceil(256));
                 pass.dispatch_workgroups(x, y, 1);
             }
-            self.sorter.encode(enc);
+            self.sorter.encode(enc, key_bits);
         }
 
         // --- 5. splats -> G-buffer
         {
-            let ts = qs
-                .filter(|_| begin_ts())
-                .map(|q| wgpu::RenderPassTimestampWrites {
-                    query_set: q,
-                    beginning_of_pass_write_index: Some(0),
-                    end_of_pass_write_index: None,
-                });
+            // The splat pass is never first when the prepass ran, so its begin
+            // slot only doubles as the frame begin for empty frames.
+            let ts = qs.map(|q| wgpu::RenderPassTimestampWrites {
+                query_set: q,
+                beginning_of_pass_write_index: Some(if begin_ts() {
+                    TS_FRAME_BEGIN
+                } else {
+                    TS_SPLAT_BEGIN
+                }),
+                end_of_pass_write_index: Some(TS_SPLAT_END),
+            });
             let atts = t.splat.attachments();
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("splat gbuffer"),
@@ -1266,8 +1330,8 @@ impl Renderer {
         {
             let ts = qs.map(|q| wgpu::RenderPassTimestampWrites {
                 query_set: q,
-                beginning_of_pass_write_index: if begin_ts() { Some(0) } else { None },
-                end_of_pass_write_index: Some(1),
+                beginning_of_pass_write_index: if begin_ts() { Some(TS_FRAME_BEGIN) } else { None },
+                end_of_pass_write_index: Some(TS_FRAME_END),
             });
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("deferred"),
@@ -1293,11 +1357,12 @@ impl Renderer {
         // --- stats readback (non-blocking)
         if stats_copy {
             if let (Some(q), Some(resolve)) = (&self.stats.query_set, &self.stats.resolve) {
-                enc.resolve_query_set(q, 0..2, resolve, 0);
-                enc.copy_buffer_to_buffer(resolve, 0, &self.stats.buffer, 0, 16);
+                enc.resolve_query_set(q, 0..TS_COUNT, resolve, 0);
+                enc.copy_buffer_to_buffer(resolve, 0, &self.stats.buffer, 0, TS_COUNT as u64 * 8);
             }
-            enc.copy_buffer_to_buffer(&self.counters, 0, &self.stats.buffer, 16, 4);
+            enc.copy_buffer_to_buffer(&self.counters, 0, &self.stats.buffer, TS_COUNT as u64 * 8, 4);
             self.stats.state = ReadbackState::Copied;
+            self.stats.prepass_begin_slot = prepass_begin_slot;
         }
     }
 
@@ -1322,16 +1387,28 @@ impl Renderer {
         {
             {
                 let data = self.stats.buffer.slice(..).get_mapped_range();
-                let words: &[u64] = bytemuck::cast_slice(&data[..16]);
-                let visible = u32::from_le_bytes(data[16..20].try_into().unwrap());
-                let gpu_ms = if self.stats.query_set.is_some() && words[1] > words[0] {
-                    Some((words[1] - words[0]) as f64 * self.stats.period as f64 / 1e6)
-                } else {
-                    None
+                let n = TS_COUNT as usize;
+                let words: &[u64] = bytemuck::cast_slice(&data[..n * 8]);
+                let visible = u32::from_le_bytes(data[n * 8..n * 8 + 4].try_into().unwrap());
+                let period = self.stats.period as f64;
+                let span = |a: u32, b: u32| {
+                    let (a, b) = (words[a as usize], words[b as usize]);
+                    (b >= a).then(|| (b - a) as f64 * period / 1e6)
                 };
+                let timed = self.stats.query_set.is_some();
+                let gpu_ms = span(TS_FRAME_BEGIN, TS_FRAME_END)
+                    .filter(|&ms| timed && ms > 0.0);
+                let stages = self.stats.prepass_begin_slot.filter(|_| timed).and_then(|b| {
+                    Some(StageTimes {
+                        prepass: span(b, TS_PREPASS_END)?,
+                        sort: span(TS_PREPASS_END, TS_SPLAT_BEGIN)?,
+                        splat: span(TS_SPLAT_BEGIN, TS_SPLAT_END)?,
+                    })
+                });
                 self.stats.last = FrameStats {
                     visible_gaussians: visible,
                     gpu_ms,
+                    stages,
                 };
             }
             self.stats.buffer.unmap();

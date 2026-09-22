@@ -230,8 +230,11 @@ impl RadixSorter {
         }));
     }
 
-    /// Record the sort. Expects unsorted pairs in `keys[0]` / `vals[0]`.
-    pub fn encode(&self, enc: &mut wgpu::CommandEncoder) {
+    /// Record the sort of the low `key_bits` bits (rounded up to a multiple of 8,
+    /// so the result lands back in index 0). Expects unsorted pairs in
+    /// `keys[0]` / `vals[0]`.
+    pub fn encode(&self, enc: &mut wgpu::CommandEncoder, key_bits: u32) {
+        let passes = (key_bits.clamp(8, 32).div_ceil(8) * 2) as usize;
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("radix sort"),
             timestamp_writes: None,
@@ -243,7 +246,7 @@ impl RadixSorter {
             &[],
         );
         pass.dispatch_workgroups(1, 1, 1);
-        for bg in &self.bind_groups {
+        for bg in &self.bind_groups[..passes] {
             pass.set_bind_group(0, bg, &[]);
             pass.set_pipeline(&self.histogram);
             pass.dispatch_workgroups_indirect(&self.args, 0);

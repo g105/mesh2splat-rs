@@ -28,7 +28,8 @@ pub fn write_ply(
     let file = File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
     let mut w = BufWriter::with_capacity(1 << 20, file);
     match format {
-        PlyFormat::Standard => write_standard(&mut w, gaussians, scale_multiplier)?,
+        PlyFormat::Standard => write_standard(&mut w, gaussians, scale_multiplier, true)?,
+        PlyFormat::StandardSh0 => write_standard(&mut w, gaussians, scale_multiplier, false)?,
         PlyFormat::Pbr => write_pbr(&mut w, gaussians, scale_multiplier)?,
         PlyFormat::CompressedPbr => write_compressed(&mut w, gaussians, scale_multiplier)?,
     }
@@ -60,14 +61,16 @@ fn log_scales(g: &GaussianVertex, m: f32) -> [f32; 3] {
     ]
 }
 
-fn write_standard(w: &mut impl Write, gs: &[GaussianVertex], m: f32) -> Result<()> {
+/// `sh_rest`: also write the 45 (zero) higher-order SH coefficients.
+fn write_standard(w: &mut impl Write, gs: &[GaussianVertex], m: f32, sh_rest: bool) -> Result<()> {
     let mut props: Vec<(String, String)> = [
         "x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2",
     ]
     .iter()
     .map(|n| ("float".to_string(), n.to_string()))
     .collect();
-    for i in 0..45 {
+    let rest = if sh_rest { 45 } else { 0 };
+    for i in 0..rest {
         props.push(("float".into(), format!("f_rest_{i}")));
     }
     for n in [
@@ -80,7 +83,7 @@ fn write_standard(w: &mut impl Write, gs: &[GaussianVertex], m: f32) -> Result<(
         .map(|(a, b)| (a.as_str(), b.as_str()))
         .collect();
     header(w, gs.len(), &props_ref)?;
-    let zeros = [0u8; 45 * 4];
+    let zeros = vec![0u8; rest * 4];
     for g in gs {
         for v in &g.position[..3] {
             f(w, *v)?;

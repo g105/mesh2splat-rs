@@ -5,35 +5,28 @@
 @group(0) @binding(1) var<storage, read> quads: array<Quad>;
 @group(0) @binding(2) var<storage, read> order: array<u32>;
 
+// Kept small on purpose: tile-based GPUs write every vertex output to memory.
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
-    @location(0) @interpolate(flat) color: vec3<f32>,
-    @location(1) @interpolate(flat) opacity: f32,
-    @location(2) @interpolate(flat) screen: vec2<f32>,
-    @location(3) @interpolate(flat) conic: vec3<f32>,
-    @location(4) @interpolate(flat) normal: vec3<f32>,
-    @location(5) @interpolate(flat) ws_pos: vec3<f32>,
-    @location(6) @interpolate(flat) metal_rough: vec2<f32>,
+    // Offset from the splat center in standard deviations along its axes, so
+    // the gaussian is exp(-0.5 * |local|^2) with no per-fragment conic math.
+    @location(0) local: vec2<f32>,
+    @location(1) @interpolate(flat) ws_pos: vec3<f32>,
+    @location(2) @interpolate(flat) packed: vec3<u32>, // color, normal, metal_rough
 };
 
 @vertex
 fn vs_main(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VsOut {
-    // Two triangles: V0 V1 V2, V0 V2 V3 with V0(-1,-1) V1(-1,1) V2(1,1) V3(1,-1)
-    var corners = array<vec2<f32>, 6>(
-        vec2<f32>(-1.0, -1.0), vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, 1.0),
-        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(1.0, -1.0));
-    let c = corners[vid];
+    // Triangle strip (-1,-1) (1,-1) (-1,1) (1,1).
+    let c = vec2<f32>(f32(vid & 1u), f32(vid >> 1u)) * 2.0 - 1.0;
     let q = quads[order[iid]];
+    let major = unpack2x16float(q.axes_ndc.x);
+    let minor = unpack2x16float(q.axes_ndc.y);
     var out: VsOut;
-    out.pos = vec4<f32>(q.mean_ndc.xy + c.x * q.axes_ndc.xy + c.y * q.axes_ndc.zw, 0.0, 1.0);
-    out.conic = vec3<f32>(-0.5 * q.conic.x, -q.conic.y, -0.5 * q.conic.z);
-    out.color = q.color.rgb * q.color.a;
-    out.opacity = q.color.a;
-    // Bottom-left origin, like gl_FragCoord in the original.
-    out.screen = (q.mean_ndc.xy + 1.0) * 0.5 * frame.resolution;
-    out.normal = q.normal.xyz;
-    out.ws_pos = q.ws_pos.xyz;
-    out.metal_rough = vec2<f32>(q.normal.w, q.ws_pos.w);
+    out.pos = vec4<f32>(q.mean_ndc + c.x * major + c.y * minor, 0.0, 1.0);
+    out.local = c * unpack2x16float(q.extent);
+    out.ws_pos = q.ws_pos;
+    out.packed = vec3<u32>(q.color, q.normal, q.metal_rough);
     return out;
 }
 
@@ -46,22 +39,25 @@ struct GBufferOut {
 
 @fragment
 fn fs_main(in: VsOut) -> GBufferOut {
-    // WebGPU's framebuffer origin is top-left; flip to the GL convention used for `screen`.
-    let frag = vec2<f32>(in.pos.x, frame.resolution.y - in.pos.y);
-    let d = in.screen - frag;
-    let power = dot(in.conic.xzy, vec3<f32>(d * d, d.x * d.y));
-    let g = exp(power);
+    let color = unpack4x8unorm(in.packed.x);
+    let opacity = color.a;
+    let g = exp(-0.5 * dot(in.local, in.local));
+    // Skip fragments that would add less than 1/255 (mostly the quad corners).
+    if (g * opacity < 1.0 / 255.0) {
+        discard;
+    }
 
     var out: GBufferOut;
     if (frame.render_mode == 4u) {
         out.albedo = vec4<f32>(0.01, 0.005, 0.0, 0.01);
     } else {
-        out.albedo = vec4<f32>(in.color, in.opacity) * g;
+        out.albedo = vec4<f32>(color.rgb * opacity, opacity) * g;
     }
     out.position = vec4<f32>(in.ws_pos, 1.0) * g;
     // Premultiply by opacity so rgb / a in the deferred pass is an opacity-weighted
     // average (the original stored the encoded normal un-premultiplied).
-    out.normal = vec4<f32>(in.normal * in.opacity, in.opacity) * g;
-    out.metal_rough = vec4<f32>(in.metal_rough, 0.0, 1.0) * g;
+    let n = encode_normal(oct_decode(unpack2x16unorm(in.packed.y)));
+    out.normal = vec4<f32>(n * opacity, opacity) * g;
+    out.metal_rough = vec4<f32>(unpack4x8unorm(in.packed.z).xy, 0.0, 1.0) * g;
     return out;
 }

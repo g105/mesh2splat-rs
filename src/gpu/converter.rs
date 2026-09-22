@@ -244,6 +244,7 @@ impl Converter {
         out.ply_has_pbr = false;
         out.resolution = res;
         out.generation += 1;
+        out.bounds = scene.bbox;
         if fragments > capacity {
             log::warn!("conversion produced {fragments} fragments but capacity is {capacity}; extra splats were dropped");
         }

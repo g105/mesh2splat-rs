@@ -106,7 +106,7 @@ fn compact(@builtin(global_invocation_id) gid3: vec3<u32>, @builtin(num_workgrou
 @compute @workgroup_size(1)
 fn write_args() {
     for (var f = 0u; f < 6u; f++) {
-        draw_args[f * 4u + 0u] = 6u;
+        draw_args[f * 4u + 0u] = 4u; // one triangle strip per splat
         draw_args[f * 4u + 1u] = atomicLoad(&face_counts[f]);
         draw_args[f * 4u + 2u] = 0u;
         draw_args[f * 4u + 3u] = 0u;

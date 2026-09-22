@@ -71,6 +71,10 @@ pub struct MergeStats {
     pub output: usize,
     /// Merged splats created at each level (index 0 = 2x2 blocks).
     pub merged_per_level: Vec<usize>,
+    /// Wall time of the merge (set by the converter).
+    pub duration: std::time::Duration,
+    /// Whether it ran on the GPU.
+    pub gpu: bool,
 }
 
 /// Grid cell marker for splats that did not come from the converter.
@@ -313,7 +317,7 @@ impl Stats {
 
 /// World size of one grid cell for splats projected along `axis` in `bbox`
 /// (mirrors `ortho_uv` in `convert.wgsl`).
-fn cell_size(bbox: &BBox, axis: u32, resolution: u32) -> f64 {
+pub(crate) fn cell_size(bbox: &BBox, axis: u32, resolution: u32) -> f64 {
     let s = bbox.size();
     let r = match axis {
         0 => s.y.max(s.z),

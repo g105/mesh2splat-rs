@@ -127,3 +127,33 @@ fn merge_after_gpu_conversion() {
     let (aa, ab) = (area(&a), area(&b));
     assert!((aa - ab).abs() / aa < 0.01, "{aa} vs {ab}");
 }
+
+#[test]
+fn gpu_merge_matches_cpu_merge() {
+    let ctx = match GpuContext::new_headless() {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipping: {e}"),
+    };
+    let s = scene::load_gltf(BOX).unwrap();
+    let gpu = GpuScene::upload(&ctx, &s);
+    let mut conv = Converter::new(&ctx);
+    for strength in [0.0, 0.25, 1.0] {
+        let settings = ConvertSettings {
+            resolution: 256,
+            bbox_mode: BBoxMode::Scene,
+            merge: Some(mesh2splat::merge::MergeSettings::from_strength(strength)),
+        };
+        let mut runs = Vec::new();
+        for gpu_merge in [false, true] {
+            conv.gpu_merge = gpu_merge;
+            let mut gb = GaussianBuffer::new_empty(&ctx);
+            let stats = conv.convert(&ctx, &gpu, settings, &mut gb);
+            runs.push(stats.merge.unwrap());
+        }
+        let (cpu, gpu) = (&runs[0], &runs[1]);
+        // f32 on the GPU vs f64 on the CPU can flip blocks sitting exactly on a
+        // tolerance, nothing more.
+        let diff = cpu.output.abs_diff(gpu.output) as f64 / cpu.output as f64;
+        assert!(diff < 0.005, "strength {strength}: cpu {cpu:?} gpu {gpu:?}");
+    }
+}

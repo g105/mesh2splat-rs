@@ -54,7 +54,16 @@ On DamagedHelmet (PSNR against the unmerged render, 1920x1080):
 At high strength it is no better than lowering the sampling density, so the
 useful range is roughly 0.1–0.5. Converting at a higher resolution and merging
 also works: 1024 px at strength 1.0 gives 771 k splats at the quality of 520 px
-unmerged (1.04 M). Merging runs on the CPU (about 0.2 s for 1 M splats on an M1).
+unmerged (1.04 M).
+
+Merging runs on the GPU (`src/gpu/merge.rs`, `shaders/merge.wgsl`): per
+quadtree level, a radix sort groups the splats by cell and depth, and one
+thread per depth layer tests and builds the merged splat. On an M1 it takes
+about 55 ms for 1 M splats and 0.2-0.3 s for 4 M, versus 0.2 s and 1.2 s for
+the multithreaded CPU version in `src/merge.rs`. The CPU version is the
+fallback for GPUs with fewer than 9 storage buffers per shader stage and for
+per-mesh projection boxes with a very large number of meshes; both give the
+same result up to f32 rounding.
 
 ## Building
 
@@ -165,13 +174,14 @@ src/
   scene.rs          glTF loading (node transforms baked, normals/tangents like the original)
   ply.rs            PLY writer (3 layouts) and reader (standard / PBR / compressed)
   camera.rs         fly camera (port of Camera.cpp) + Maya tumble / pan / dolly
-  merge.rs          optional quadtree merge of alike neighbouring splats
+  merge.rs          optional quadtree merge of alike neighbouring splats (CPU reference)
   cli.rs, main.rs   clap CLI
   app.rs            eframe/egui UI (port of ImGuiUI + GuiRendererConcreteMediator)
   gpu/
     converter.rs    ConversionPass
     scene.rs        vertex buffers, textures (CPU mip chain), per-mesh bind groups
     sort.rs         GPU radix sort (replaces gl-radix-sort)
+    merge.rs        GPU version of the splat merge
     renderer.rs     all render passes, uniforms, G-buffers, readback
     shaders/*.wgsl  ports of the GLSL shaders
 ```

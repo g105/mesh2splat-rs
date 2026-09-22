@@ -3,7 +3,7 @@
 //! ```text
 //! cargo run --release --example bench -- [model.glb] [--res 520,1024] [--size 1920x1080]
 //!                                        [--frames 60] [--out target/bench] [--baseline dir]
-//!                                        [--merge strength]
+//!                                        [--merge strength] [--cpu-merge]
 //! ```
 //!
 //! For each sampling resolution it converts the model, renders a fixed set of
@@ -30,6 +30,7 @@ struct Args {
     out: PathBuf,
     baseline: Option<PathBuf>,
     merge: Option<f32>,
+    cpu_merge: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -41,6 +42,7 @@ fn parse_args() -> Result<Args> {
         out: "target/bench".into(),
         baseline: None,
         merge: None,
+        cpu_merge: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -61,6 +63,7 @@ fn parse_args() -> Result<Args> {
             "--out" => a.out = val()?.into(),
             "--baseline" => a.baseline = Some(val()?.into()),
             "--merge" => a.merge = Some(val()?.parse()?),
+            "--cpu-merge" => a.cpu_merge = true,
             _ => a.model = arg.into(),
         }
     }
@@ -141,6 +144,7 @@ fn main() -> Result<()> {
     );
 
     let mut converter = Converter::new(&ctx);
+    converter.gpu_merge = !args.cpu_merge;
     let mut renderer = Renderer::new(&ctx);
     let settings = RenderSettings::default();
     let mut framed = Camera::default();
@@ -165,10 +169,12 @@ fn main() -> Result<()> {
         );
         if let Some(m) = &conv.merge {
             println!(
-                "   merged {} -> {} ({:.2}x fewer), new splats per level {:?}",
+                "   merged {} -> {} ({:.2}x fewer) in {:.1} ms on the {}, new splats per level {:?}",
                 m.input,
                 m.output,
                 m.input as f64 / m.output.max(1) as f64,
+                m.duration.as_secs_f64() * 1e3,
+                if m.gpu { "GPU" } else { "CPU" },
                 m.merged_per_level
             );
         }

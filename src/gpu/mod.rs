@@ -1,6 +1,7 @@
 //! wgpu implementation of the converter and the renderer.
 
 pub mod converter;
+pub mod merge;
 pub mod renderer;
 pub mod scene;
 pub mod sort;

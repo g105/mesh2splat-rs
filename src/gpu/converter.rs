@@ -2,6 +2,7 @@
 
 use std::time::{Duration, Instant};
 
+use super::merge::GpuMerger;
 use super::scene::{mesh_bind_group_layout, GpuScene};
 use super::{pipeline_layout, shader_with_common, storage_entry, GaussianBuffer, GpuContext};
 use crate::merge::{self, GridInfo, MergeSettings, MergeStats};
@@ -57,6 +58,9 @@ pub struct ConversionStats {
 }
 
 pub struct Converter {
+    /// Merge on the GPU when enabled and supported (else on the CPU).
+    pub gpu_merge: bool,
+    merger: Option<GpuMerger>,
     pipeline: wgpu::RenderPipeline,
     output_bgl: wgpu::BindGroupLayout,
     counter: wgpu::Buffer,
@@ -117,6 +121,8 @@ impl Converter {
             mapped_at_creation: false,
         });
         Self {
+            gpu_merge: true,
+            merger: None,
             pipeline,
             output_bgl,
             counter,
@@ -252,12 +258,7 @@ impl Converter {
         let mut merge_stats = None;
         let count = match settings.merge {
             Some(cfg) if count > 0 => {
-                let splats: Vec<GaussianVertex> = bytemuck::cast_slice(&ctx.read_buffer(
-                    &out.buffer,
-                    0,
-                    count as u64 * std::mem::size_of::<GaussianVertex>() as u64,
-                ))
-                .to_vec();
+                let merge_start = Instant::now();
                 let grid = GridInfo {
                     resolution: res,
                     boxes: match settings.bbox_mode {
@@ -265,15 +266,41 @@ impl Converter {
                         BBoxMode::PerMesh => scene.meshes.iter().map(|m| m.bbox).collect(),
                     },
                 };
-                let (merged, stats) = merge::merge(&splats, &grid, &cfg);
-                out.buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("gaussians"),
-                    contents: bytemuck::cast_slice(&merged),
-                    usage: GaussianBuffer::USAGE,
-                });
-                out.capacity = merged.len() as u32;
-                merge_stats = Some(stats);
-                merged.len() as u32
+                if self.gpu_merge && GpuMerger::supports(&grid) && self.merger.is_none() {
+                    self.merger = GpuMerger::new(ctx);
+                }
+                if let (true, true, Some(merger)) = (
+                    self.gpu_merge,
+                    GpuMerger::supports(&grid),
+                    self.merger.as_mut(),
+                ) {
+                    let (buffer, merged, mut stats) =
+                        merger.run(ctx, &out.buffer, count, &grid, &cfg);
+                    ctx.wait_idle();
+                    stats.duration = merge_start.elapsed();
+                    stats.gpu = true;
+                    out.buffer = buffer;
+                    out.capacity = merged.max(1);
+                    merge_stats = Some(stats);
+                    merged
+                } else {
+                    let splats: Vec<GaussianVertex> = bytemuck::cast_slice(&ctx.read_buffer(
+                        &out.buffer,
+                        0,
+                        count as u64 * std::mem::size_of::<GaussianVertex>() as u64,
+                    ))
+                    .to_vec();
+                    let (merged, mut stats) = merge::merge(&splats, &grid, &cfg);
+                    out.buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("gaussians"),
+                        contents: bytemuck::cast_slice(&merged),
+                        usage: GaussianBuffer::USAGE,
+                    });
+                    out.capacity = merged.len() as u32;
+                    stats.duration = merge_start.elapsed();
+                    merge_stats = Some(stats);
+                    merged.len() as u32
+                }
             }
             _ => count,
         };

@@ -853,10 +853,12 @@ impl App {
             ));
             if let Some(m) = &c.merge {
                 ui.label(format!(
-                    "Merged {} -> {} splats ({:.1}x fewer)",
+                    "Merged {} -> {} splats ({:.1}x fewer, {:.0} ms on the {})",
                     fmt_thousands(m.input as u64),
                     fmt_thousands(m.output as u64),
-                    m.input as f64 / m.output.max(1) as f64
+                    m.input as f64 / m.output.max(1) as f64,
+                    m.duration.as_secs_f64() * 1e3,
+                    if m.gpu { "GPU" } else { "CPU" }
                 ));
             }
         }

@@ -117,12 +117,15 @@ enum GizmoTarget {
 enum CameraControls {
     /// Original Mesh2Splat fly camera (RMB look + WASD).
     Fly,
-    /// Maya: Alt+LMB tumble, Alt+MMB (or Alt+Cmd+LMB) pan, Alt+RMB / wheel / pinch dolly, F frame.
+    /// Maya (the default): Alt+LMB tumble, Alt+MMB (or Alt+Cmd+LMB) pan,
+    /// Alt+RMB / wheel / pinch dolly, F frame, Q/W/E/R tools.
     Maya,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GizmoOp {
+    /// Maya's select tool: no gizmo.
+    None,
     Translate,
     Rotate,
     Scale,
@@ -248,7 +251,7 @@ impl App {
             loaded_path: None,
             output_texture: None,
             camera: Camera::default(),
-            camera_controls: CameraControls::Fly,
+            camera_controls: CameraControls::Maya,
             settings: RenderSettings::default(),
             quality: 0.5,
             max_res: 1024,
@@ -745,10 +748,14 @@ impl App {
 
             egui::CollapsingHeader::new("Gizmo").default_open(false).show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.gizmo_op, GizmoOp::None, "None");
                     ui.radio_value(&mut self.gizmo_op, GizmoOp::Translate, "Translate");
                     ui.radio_value(&mut self.gizmo_op, GizmoOp::Rotate, "Rotate");
                     ui.radio_value(&mut self.gizmo_op, GizmoOp::Scale, "Scale");
                 });
+                if self.camera_controls == CameraControls::Maya {
+                    ui.small("Hotkeys: Q none, W move, E rotate, R scale.");
+                }
                 if self.gizmo_op != GizmoOp::Scale {
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut self.gizmo_orientation, GizmoOrientation::Local, "Local");
@@ -778,7 +785,7 @@ impl App {
             ui.separator();
             ui.small(match self.camera_controls {
                 CameraControls::Fly => "Camera: RMB drag to look, WASD move, Q/E down/up, R/T roll, Shift fast, Ctrl slow, wheel zoom, F frame.",
-                CameraControls::Maya => "Camera: Alt+LMB tumble, Alt+MMB or Alt+Cmd+LMB pan, Alt+RMB / wheel / pinch dolly, F frame.",
+                CameraControls::Maya => "Camera: Alt+LMB tumble, Alt+MMB or Alt+Cmd+LMB pan, Alt+RMB / wheel / pinch dolly, F frame, Q/W/E/R tools.",
             });
         });
     }
@@ -982,6 +989,21 @@ impl App {
         if !wants_kb && response.hovered() && ui.input(|i| i.key_pressed(egui::Key::F)) {
             self.focus_model();
         }
+        // Maya's tool hotkeys; in Fly mode these keys drive the camera.
+        if !wants_kb && self.camera_controls == CameraControls::Maya {
+            ui.input(|i| {
+                for (key, op) in [
+                    (egui::Key::Q, GizmoOp::None),
+                    (egui::Key::W, GizmoOp::Translate),
+                    (egui::Key::E, GizmoOp::Rotate),
+                    (egui::Key::R, GizmoOp::Scale),
+                ] {
+                    if i.key_pressed(key) {
+                        self.gizmo_op = op;
+                    }
+                }
+            });
+        }
         match self.camera_controls {
             CameraControls::Fly => self.fly_input(ui, response, dt, wants_kb),
             CameraControls::Maya => self.maya_input(ui, response),
@@ -1028,8 +1050,8 @@ impl App {
             } else if response.dragged_by(egui::PointerButton::Middle) {
                 self.camera.pan(d.x, d.y, response.rect.height());
             } else if response.dragged_by(egui::PointerButton::Secondary) {
-                // Drag right or down to dolly in, left or up to dolly out.
-                self.camera.dolly((d.x + d.y) * 0.005);
+                // Maya's dolly is horizontal: drag right to move in, left to move out.
+                self.camera.dolly(d.x * 0.005);
             }
         }
         if response.hovered() {
@@ -1157,11 +1179,11 @@ impl App {
         }
 
         // Transform gizmo
-        if self.gaussians.count > 0 {
+        if self.gaussians.count > 0 && self.gizmo_op != GizmoOp::None {
             let modes = match self.gizmo_op {
-                GizmoOp::Translate => GizmoMode::all_translate(),
                 GizmoOp::Rotate => GizmoMode::all_rotate(),
                 GizmoOp::Scale => GizmoMode::all_scale(),
+                _ => GizmoMode::all_translate(),
             };
             self.gizmo.update_config(GizmoConfig {
                 view_matrix: view.as_dmat4().into(),

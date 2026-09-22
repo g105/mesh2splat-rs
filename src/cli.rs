@@ -46,6 +46,8 @@ pub enum FormatArg {
     Sh0,
     Pbr,
     Compressed,
+    /// PlayCanvas / SuperSplat compressed PLY (~16 bytes per splat).
+    Playcanvas,
 }
 
 impl From<FormatArg> for PlyFormat {
@@ -55,6 +57,7 @@ impl From<FormatArg> for PlyFormat {
             FormatArg::Sh0 => PlyFormat::StandardSh0,
             FormatArg::Pbr => PlyFormat::Pbr,
             FormatArg::Compressed => PlyFormat::CompressedPbr,
+            FormatArg::Playcanvas => PlyFormat::PlayCanvas,
         }
     }
 }

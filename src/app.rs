@@ -13,7 +13,7 @@ use transform_gizmo_egui::math::Transform;
 use transform_gizmo_egui::{Gizmo, GizmoConfig, GizmoExt, GizmoMode, GizmoOrientation};
 
 use crate::camera::{Camera, CameraKeys};
-use crate::gpu::converter::{resolution_from_quality, ConversionStats};
+use crate::gpu::converter::{resolution_from_quality, ConversionStats, DetailSettings};
 use crate::merge::MergeSettings;
 use crate::gpu::renderer::OUTPUT_FORMAT;
 use crate::gpu::{
@@ -168,6 +168,8 @@ pub struct App {
     bbox_mode: BBoxMode,
     merge_enabled: bool,
     merge_strength: f32,
+    detail_enabled: bool,
+    detail_strength: f32,
     needs_conversion: bool,
     last_conversion: Option<ConversionStats>,
 
@@ -253,6 +255,8 @@ impl App {
             bbox_mode: BBoxMode::Scene,
             merge_enabled: false,
             merge_strength: MergeSettings::DEFAULT_STRENGTH,
+            detail_enabled: false,
+            detail_strength: DetailSettings::DEFAULT_STRENGTH,
             needs_conversion: false,
             last_conversion: None,
             output_folder: String::new(),
@@ -318,6 +322,9 @@ impl App {
             merge: self
                 .merge_enabled
                 .then(|| MergeSettings::from_strength(self.merge_strength)),
+            detail: self
+                .detail_enabled
+                .then(|| DetailSettings::from_strength(self.detail_strength)),
         }
     }
 
@@ -663,6 +670,19 @@ impl App {
                         }
                     }
                 });
+                if ui
+                    .checkbox(&mut self.detail_enabled, "Detail-aware density")
+                    .on_hover_text("Sample triangles whose textures barely vary on a coarser grid (down to 1/8 density), so detail decides where the splats go.")
+                    .changed()
+                {
+                    self.needs_conversion = true;
+                }
+                if self.detail_enabled {
+                    let r = ui.add(egui::Slider::new(&mut self.detail_strength, 0.0..=1.0).text("Detail tolerance"));
+                    if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                        self.needs_conversion = true;
+                    }
+                }
                 if ui
                     .checkbox(&mut self.merge_enabled, "Merge similar splats")
                     .on_hover_text("Replace blocks of neighbouring splats with the same colour, normal and material by one larger splat (up to 16x16). Fewer splats: faster rendering and smaller files.")

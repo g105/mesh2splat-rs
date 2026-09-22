@@ -86,6 +86,10 @@ pub struct SamplingArgs {
     /// strength in [0, 1] (0 = only identical splats, default 0.25).
     #[arg(long, value_name = "STRENGTH", num_args = 0..=1, default_missing_value = "0.25")]
     pub merge: Option<f32>,
+    /// Sample low-detail triangles on a coarser grid, with an optional
+    /// tolerance in [0, 1] (default 0.25).
+    #[arg(long, value_name = "TOLERANCE", num_args = 0..=1, default_missing_value = "0.25")]
+    pub detail: Option<f32>,
 }
 
 impl SamplingArgs {
@@ -99,6 +103,9 @@ impl SamplingArgs {
                 BBoxArg::PerMesh => BBoxMode::PerMesh,
             },
             merge: self.merge.map(crate::merge::MergeSettings::from_strength),
+            detail: self
+                .detail
+                .map(crate::gpu::converter::DetailSettings::from_strength),
         }
     }
 }

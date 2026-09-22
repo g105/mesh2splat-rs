@@ -31,6 +31,34 @@ triangle from a storage buffer and computes the same values
 (`src/gpu/shaders/convert.wgsl`). The fragment shader appends gaussians to a
 storage buffer with an atomic counter, exactly like the original.
 
+### Detail-aware sampling density
+
+Optional, and not in the original. Before conversion, a compute pass gives each
+triangle its own sampling level: it compares the textures at the texel footprint
+of level 0 and of a coarser level (the splat spacing that level would give) and
+keeps the coarsest level whose difference stays within a tolerance. Each level is
+then rasterized into its own smaller target, which lands on every 2^level-th cell
+of the same grid, and the splats of that level are scaled to match
+(`src/gpu/shaders/detail.wgsl`). Levels are also capped so a splat never
+outgrows its own triangle.
+
+On DamagedHelmet at 520 px (PSNR against the unmerged render):
+
+| | splats | PSNR (orbit views) | PSNR (close-up) |
+|---|---|---|---|
+| no merge, no detail | 1.04 M | reference | reference |
+| detail 0.25 | 751 k | 43–45 dB | 38 dB |
+| detail 0.5 | 606 k | 39–42 dB | 34 dB |
+| merge 0.25 | 545 k | 44–45 dB | 36 dB |
+
+Merging gives more reduction per dB than this does, and combining the two is
+worse than merging alone at the same splat count, because the level is chosen
+per triangle: one detailed corner keeps the whole triangle dense. What detail
+levels do give is a cheaper conversion — the coarse splats are never created,
+so nothing has to be merged away afterwards — which matters mainly at high
+sampling density. Both are off by default; **merging is the better first
+choice.**
+
 ### Merging similar splats
 
 Optional, and not in the original. After conversion, blocks of 2x2 neighbouring
@@ -89,7 +117,7 @@ The side panel mirrors the original's ImGui windows:
 
 * **Input** — pick or drop a `.glb`, `.gltf` or `.ply` file.
 * **Output** — choose the output folder, file name and format (Standard / Standard SH0 / PBR / Compressed PBR), then press **Save splat**. *Standard SH0* leaves out the 45 higher-order SH coefficients, which are always zero for converted meshes, so files are about 3.6x smaller.
-* **Properties** — visualization mode (Final, Albedo, Depth, Normals, Geometry, Overdraw, PBR), mesh/gaussian depth test, gaussian scale, sampling density (16 up to 1024/2048/4096 px), projection box, **Merge similar splats** (see below), background color and split-screen.
+* **Properties** — visualization mode (Final, Albedo, Depth, Normals, Geometry, Overdraw, PBR), mesh/gaussian depth test, gaussian scale, sampling density (16 up to 1024/2048/4096 px), projection box, **Detail-aware density** and **Merge similar splats** (see below), background color and split-screen.
 * **Lighting** — point light with intensity, color and a cube shadow map.
 * **Camera** — switch between the original fly controls and Maya-style controls, and frame the model.
 * **Gizmo** — translate, rotate or scale the model or the light (local or world axes).
@@ -126,6 +154,9 @@ mesh2splat convert model.glb --resolution 2048 --format pbr --std 0.65
 
 # SH0-only standard layout (much smaller, same visual result for converted meshes)
 mesh2splat convert model.glb -o model.ply --format sh0
+
+# sample low-detail triangles on a coarser grid (optional tolerance, default 0.25)
+mesh2splat convert model.glb -o model.ply --detail
 
 # merge alike neighbouring splats (optional strength, default 0.25)
 mesh2splat convert model.glb -o model.ply --merge
@@ -178,7 +209,7 @@ src/
   cli.rs, main.rs   clap CLI
   app.rs            eframe/egui UI (port of ImGuiUI + GuiRendererConcreteMediator)
   gpu/
-    converter.rs    ConversionPass
+    converter.rs    ConversionPass (one pass per sampling level)
     scene.rs        vertex buffers, textures (CPU mip chain), per-mesh bind groups
     sort.rs         GPU radix sort (replaces gl-radix-sort)
     merge.rs        GPU version of the splat merge

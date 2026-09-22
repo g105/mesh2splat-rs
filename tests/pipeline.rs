@@ -46,6 +46,7 @@ fn convert_export_reload() {
         ConvertSettings {
             resolution: res,
             bbox_mode: BBoxMode::Scene,
+            detail: None,
             merge: None,
         },
         &mut gb,
@@ -91,6 +92,7 @@ fn merge_after_gpu_conversion() {
     let settings = |merge| ConvertSettings {
         resolution: 128,
         bbox_mode: BBoxMode::Scene,
+        detail: None,
         merge,
     };
     let mut plain = GaussianBuffer::new_empty(&ctx);
@@ -141,6 +143,7 @@ fn gpu_merge_matches_cpu_merge() {
         let settings = ConvertSettings {
             resolution: 256,
             bbox_mode: BBoxMode::Scene,
+            detail: None,
             merge: Some(mesh2splat::merge::MergeSettings::from_strength(strength)),
         };
         let mut runs = Vec::new();
@@ -155,5 +158,51 @@ fn gpu_merge_matches_cpu_merge() {
         // tolerance, nothing more.
         let diff = cpu.output.abs_diff(gpu.output) as f64 / cpu.output as f64;
         assert!(diff < 0.005, "strength {strength}: cpu {cpu:?} gpu {gpu:?}");
+    }
+}
+
+#[test]
+fn detail_aware_density() {
+    let ctx = match GpuContext::new_headless() {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipping: {e}"),
+    };
+    let s = scene::load_gltf(BOX).unwrap();
+    let gpu = GpuScene::upload(&ctx, &s);
+    let mut conv = Converter::new(&ctx);
+    let settings = |detail| ConvertSettings {
+        resolution: 128,
+        bbox_mode: BBoxMode::Scene,
+        merge: None,
+        detail,
+    };
+    let mut count = |detail| {
+        let mut gb = GaussianBuffer::new_empty(&ctx);
+        let stats = conv.convert(&ctx, &gpu, settings(detail), &mut gb);
+        (stats.gaussians, gb.download(&ctx))
+    };
+    use mesh2splat::gpu::converter::DetailSettings;
+    let (plain, _) = count(None);
+    // Zero tolerance keeps every triangle at level 0.
+    let (exact, _) = count(Some(DetailSettings::from_strength(0.0)));
+    assert_eq!(exact, plain);
+    // A loose tolerance coarsens the flat cube faces by one level: a quarter
+    // of the splats, each twice as wide.
+    let (coarse, splats) = count(Some(DetailSettings::from_strength(1.0)));
+    assert!(
+        (coarse as f64 - plain as f64 / 4.0).abs() / plain as f64 * 4.0 < 0.05,
+        "{coarse} vs {plain} / 4"
+    );
+    let width = |g: &[mesh2splat::GaussianVertex]| {
+        g.iter()
+            .map(|g| g.scale[0].max(g.scale[1]))
+            .fold(0.0f32, f32::max)
+    };
+    let (_, fine) = count(None);
+    assert!((width(&splats) - 2.0 * width(&fine)).abs() < 1e-3);
+    // Coarser splats still sit on the cube surface.
+    for g in &splats {
+        let p = glam::Vec3::from_slice(&g.position[..3]);
+        assert!((p.abs().max_element() - 0.5).abs() < 1e-3, "{p}");
     }
 }

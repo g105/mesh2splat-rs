@@ -21,6 +21,9 @@ struct MeshParams {
     bbox_max: vec4<f32>,
     base_color_factor: vec4<f32>,
     flags: vec4<u32>, // has albedo, has normal, has metallic-roughness, max gaussians
+    // detail-aware density: pass level, triangle count, max level, enabled
+    detail: vec4<u32>,
+    detail_tol: vec4<f32>, // tolerance, conversion resolution
 };
 
 // Per-visible-splat data produced by the prepass (QuadNdcTransformation),

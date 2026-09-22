@@ -30,6 +30,7 @@ struct Args {
     out: PathBuf,
     baseline: Option<PathBuf>,
     merge: Option<f32>,
+    detail: Option<f32>,
     cpu_merge: bool,
 }
 
@@ -42,6 +43,7 @@ fn parse_args() -> Result<Args> {
         out: "target/bench".into(),
         baseline: None,
         merge: None,
+        detail: None,
         cpu_merge: false,
     };
     let mut it = std::env::args().skip(1);
@@ -63,6 +65,7 @@ fn parse_args() -> Result<Args> {
             "--out" => a.out = val()?.into(),
             "--baseline" => a.baseline = Some(val()?.into()),
             "--merge" => a.merge = Some(val()?.parse()?),
+            "--detail" => a.detail = Some(val()?.parse()?),
             "--cpu-merge" => a.cpu_merge = true,
             _ => a.model = arg.into(),
         }
@@ -158,6 +161,9 @@ fn main() -> Result<()> {
             ConvertSettings {
                 resolution: res,
                 merge: args.merge.map(mesh2splat::merge::MergeSettings::from_strength),
+                detail: args
+                    .detail
+                    .map(mesh2splat::gpu::converter::DetailSettings::from_strength),
                 ..Default::default()
             },
             &mut gaussians,

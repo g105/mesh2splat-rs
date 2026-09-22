@@ -9,6 +9,8 @@
 
 @group(0) @binding(0) var<storage, read_write> gaussians: array<Gaussian>;
 @group(0) @binding(1) var<storage, read_write> counter: atomic<u32>;
+// Sampling level drawn by this pass (detail-aware density).
+@group(0) @binding(2) var<uniform> pass_level: vec4<u32>;
 
 @group(1) @binding(0) var<uniform> params: MeshParams;
 @group(1) @binding(1) var<storage, read> vertices: array<Vertex>;
@@ -16,6 +18,7 @@
 @group(1) @binding(3) var normal_tex: texture_2d<f32>;
 @group(1) @binding(4) var mr_tex: texture_2d<f32>;
 @group(1) @binding(5) var mat_sampler: sampler;
+@group(1) @binding(6) var<storage, read> tri_levels: array<u32>;
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -76,6 +79,17 @@ fn ortho_uv(p: vec3<f32>, an: vec3<f32>) -> vec2<f32> {
 fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
     let tri = vid / 3u;
     let corner = vid % 3u;
+    // Detail-aware density: each triangle is rasterized in the pass of its own
+    // level, into a target of resolution >> level.
+    var level = 0u;
+    if (params.detail.w == 1u) {
+        level = tri_levels[tri];
+    }
+    if (level != pass_level.x) {
+        var skip: VsOut;
+        skip.clip = vec4<f32>(10.0, 10.0, 0.0, 1.0); // outside the clip volume
+        return skip;
+    }
     let v0 = vertices[tri * 3u];
     let v1 = vertices[tri * 3u + 1u];
     let v2 = vertices[tri * 3u + 2u];
@@ -113,7 +127,10 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
     out.uv = this_v.uv.xy;
     out.tangent = this_v.tangent;
     out.normal = this_v.normal.xyz;
-    out.scale = vec3<f32>(length(j[0]), length(j[1]), 1e-7);
+    // Coarser levels carry proportionally larger splats: the renderer scales
+    // every splat by std / resolution, which is the level-0 spacing.
+    let spread = f32(1u << level);
+    out.scale = vec3<f32>(length(j[0]) * spread, length(j[1]) * spread, 1e-7);
     out.quat = vec4<f32>(q.w, q.x, q.y, q.z);
     // Same branch order as ortho_uv.
     if (an.x > an.y && an.x > an.z) {
@@ -158,8 +175,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         g.color = color * params.base_color_factor;
         // Spare .w slots record where the splat sits on the conversion grid
         // (read back by `merge`): axis << 30 | y << 15 | x, and the mesh index.
-        let cell = vec2<u32>(in.clip.xy);
-        let grid = (in.axis << 30u) | (min(cell.y, 0x7fffu) << 15u) | min(cell.x, 0x7fffu);
+        // Only level-0 splats sit on the full-resolution grid the merge uses.
+        var grid = 0xc0000000u; // axis 3: not on the grid
+        if (pass_level.x == 0u) {
+            let cell = vec2<u32>(in.clip.xy);
+            grid = (in.axis << 30u) | (min(cell.y, 0x7fffu) << 15u) | min(cell.x, 0x7fffu);
+        }
         g.scale = vec4<f32>(in.scale, bitcast<f32>(grid));
         g.normal = vec4<f32>(n, bitcast<f32>(u32(params.bbox_min.w)));
         g.rotation = in.quat;

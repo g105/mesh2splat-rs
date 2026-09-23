@@ -888,6 +888,35 @@ impl App {
                         ui.add(egui::Slider::new(&mut self.settings.shadow_density, 0.0..=20.0).text("Shadow density"));
                         ui.add(egui::Slider::new(&mut self.settings.transmission, 0.0..=2.0).text("Transmission"));
                     }
+                    ui.collapsing("Material", |ui| {
+                        ui.add(egui::Slider::new(&mut self.settings.ior, 1.0..=2.5).text("Index of refraction"))
+                            .on_hover_text("Sets how strong the specular reflection is: 1.5 for most dielectrics, about 1.55 for hair.");
+                        if self.settings.hair_shading {
+                            ui.add(egui::Slider::new(&mut self.settings.fibre_roughness.x, 0.0..=1.0).text("Highlight along strand"));
+                            ui.add(egui::Slider::new(&mut self.settings.fibre_roughness.y, 0.0..=1.0).text("Highlight across strand"));
+                            ui.add(egui::Slider::new(&mut self.settings.fibre_shift, 0.0..=0.3).text("Lobe shift"));
+                        } else {
+                            ui.add(egui::Slider::new(&mut self.settings.anisotropy, 0.0..=1.0).text("Anisotropy"))
+                                .on_hover_text("Stretches the highlight along each splat's longest axis: brushed metal, hair cards.");
+                        }
+                        ui.horizontal(|ui| {
+                            let mut c = self.settings.sheen_color.to_array();
+                            if ui.color_edit_button_rgb(&mut c).changed() {
+                                self.settings.sheen_color = Vec3::from_array(c);
+                            }
+                            ui.label("Sheen")
+                                .on_hover_text("The soft rim a fibrous surface shows at grazing angles. Black turns it off.");
+                        });
+                        ui.add(egui::Slider::new(&mut self.settings.sheen_roughness, 0.05..=1.0).text("Sheen roughness"));
+                        ui.horizontal(|ui| {
+                            let mut c = self.settings.attenuation_color.to_array();
+                            if ui.color_edit_button_rgb(&mut c).changed() {
+                                self.settings.attenuation_color = Vec3::from_array(c);
+                            }
+                            ui.label("Transmission tint")
+                                .on_hover_text("What light keeps after travelling through the splats (Beer-Lambert). Needs opacity shadows.");
+                        });
+                    });
                     ui.checkbox(&mut self.settings.forward_shading, "Forward (per-splat) shading")
                         .on_hover_text("Shade every splat in the splat pass instead of once per pixel afterwards, so overlapping splats blend as lit surfaces. Slower: shading runs per fragment.");
                     ui.add(egui::Slider::new(&mut self.settings.light_intensity, 0.0..=1000.0).logarithmic(true).text("Light intensity"));

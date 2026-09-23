@@ -68,7 +68,17 @@ them as surfaces reads as felt. Three settings (all off by default) target that:
 * **Anisotropic (hair) shading** — Kajiya-Kay: both the diffuse and the two
   specular lobes work off the angle to each splat's longest axis instead of its
   normal. The tangent rides through the G-buffer as an angle in the plane of the
-  normal, packed into a channel that was previously written as zero.
+  normal, packed into a channel that was previously written as zero. The two
+  lobes take separate roughnesses — sharp along the strand, broad across it,
+  which is what reads as hair — and the primary keeps the colour of the light
+  while the secondary carries the hair's, with Fresnel from the **index of
+  refraction** (1.5 for most dielectrics, ~1.55 for hair).
+* **Sheen** — the soft rim a fibrous surface shows at grazing angles (Charlie
+  distribution), which is most of what separates fur from plastic. Black by
+  default, so it costs nothing until asked for.
+* **Anisotropy** for the normal PBR model stretches the highlight along each
+  splat's longest axis, for brushed metal and hair cards. 0 by default, which
+  is the isotropic GGX the renderer had before.
 * **Baked occlusion** — splats have no surface to trace against, so a compute
   pass voxelizes their opacity into a density grid and then, per splat, marches
   it along 16 directions. The average transmittance is the occlusion and the

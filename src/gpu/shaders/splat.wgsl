@@ -121,10 +121,11 @@ fn fs_forward(in: VsOut) -> GBufferOut {
     let through = exp(-lt.shadow_density * optical);
     var lo = vec3<f32>(0.0);
     if (lt.hair == 1u) {
-        lo = hair_lighting(t, n, v, l, albedo, mr.y);
+        lo = hair_lighting(t, n, v, l, albedo, lt.fibre.yz, f0_from_ior(lt.fibre.x), lt.fibre.w);
     } else {
-        lo = pbr_lighting(n, v, l, albedo, mr.x, mr.y);
+        lo = pbr_lighting(n, t, v, l, albedo, mr.x, mr.y, lt.fibre.x, lt.aniso.x);
     }
+    lo += sheen_lighting(n, v, l, lt.sheen.rgb, lt.sheen.w);
     lo *= radiance * through;
     if (lt.transmission > 0.0) {
         let tint = attenuation_tint(lt.attenuation.rgb, lt.attenuation.w, optical);

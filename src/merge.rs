@@ -686,3 +686,43 @@ mod tests {
         assert_eq!(out.len(), 5 + 3 + 1 + 2);
     }
 }
+
+#[cfg(test)]
+mod axis_tests {
+    use super::*;
+
+    /// `compute_cov3d(rot, s)` in the shaders is `rot^T * diag(s^2) * rot`, so
+    /// the axis belonging to `scale[i]` is row `i` of that matrix — which is
+    /// `rot[i]` (a column) only if the matrix is symmetric. The prepass picks a
+    /// column, so this pins the difference down.
+    #[test]
+    fn splat_axis_is_a_row_of_the_shader_rotation() {
+        let q = Quat::from_euler(glam::EulerRot::XYZ, 0.5, 0.9, -0.4);
+        let scale = [2.0f32, 0.5, 1e-3];
+        let g = GaussianVertex {
+            rotation: [q.w, q.x, q.y, q.z],
+            scale: [scale[0], scale[1], scale[2], 0.0],
+            ..Default::default()
+        };
+        // `splat_axes` is the shader's `cast_quat_to_mat3` transposed (verified
+        // by `covariance_round_trip`): its columns are the splat's axes.
+        let axes = splat_axes(g.rotation);
+        let cov = shape_covariance(&g);
+        for i in 0..3 {
+            let axis = axes.col(i);
+            let scaled = cov * axis;
+            let expected = axis * (scale[i] * scale[i]) as f64;
+            assert!(
+                (scaled - expected).length() < 1e-6,
+                "axis {i} is not an eigenvector: {scaled} vs {expected}"
+            );
+        }
+        // The shader's matrix is the transpose, so its *rows* are those axes.
+        let shader_rot = axes.transpose();
+        for i in 0..3 {
+            assert!((shader_rot.row(i) - axes.col(i)).length() < 1e-9);
+            // ...and its columns are something else entirely.
+            assert!((shader_rot.col(i) - axes.col(i)).length() > 1e-3);
+        }
+    }
+}

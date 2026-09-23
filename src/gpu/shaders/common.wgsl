@@ -85,6 +85,12 @@ fn cast_quat_to_mat3(q: vec4<f32>) -> mat3x3<f32> {
     return mat3x3<f32>(first, second, third);
 }
 
+// `compute_cov3d` builds rot^T * diag(s^2) * rot, so the axis belonging to
+// `s[i]` is row `i` of `rot` (its columns are something else).
+fn splat_axis(rot: mat3x3<f32>, i: u32) -> vec3<f32> {
+    return normalize(vec3<f32>(rot[0][i], rot[1][i], rot[2][i]));
+}
+
 fn compute_cov3d(rot: mat3x3<f32>, s: vec3<f32>) -> mat3x3<f32> {
     let sm = mat3x3<f32>(s.x, 0.0, 0.0, 0.0, s.y, 0.0, 0.0, 0.0, s.z);
     let m = sm * rot;

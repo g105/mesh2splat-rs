@@ -61,7 +61,7 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>, @builtin(num_workgroups)
         } else if (g.scale.z < g.scale.y && g.scale.z < g.scale.x) {
             min_idx = 2u;
         }
-        normal_ws = vec4<f32>(encode_normal(rot[min_idx]), g.color.a);
+        normal_ws = vec4<f32>(encode_normal(splat_axis(rot, min_idx)), g.color.a);
     }
 
     var color = g.color;

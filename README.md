@@ -78,23 +78,39 @@ them as surfaces reads as felt. Three settings (all off by default) target that:
   pixel afterwards, so overlapping strands blend as lit strands rather than as
   one averaged surface, each using its own normal and tangent. Sharper
   highlights on fine geometry, at the cost of shading per fragment instead of
-  per pixel; with hair's overdraw that is a real cost.
+  per pixel; with hair's overdraw that is a real cost. On an M1 at 1600x1200:
 
-`examples/groom.rs` converts a hair groom in Cem Yuksel's `.hair` strand format
-and exercises all three:
+| groom | splats | deferred | forward |
+|---|---|---|---|
+| straight, front | 450 k | 23 ms | 49 ms |
+| straight, close | 450 k | 32 ms | 94 ms |
+| curly, front | 3.4 M | 136 ms | 247 ms |
+| curly, close | 3.4 M | 153 ms | 333 ms |
+
+  So it costs 2-4x the frame, all of it in the splat raster: worth it for a
+  close look at fine geometry, not for a full groom in motion.
+
+Open a `.hair` groom in the viewer like any other file (**Input**, or drag and
+drop). It loads as strand-aligned splats, turns on hair shading and opacity
+shadows, and a **Groom** section appears with the strand count, splats per
+segment, width and opacity — each rebuilds the splats. Enable **Lighting** to
+see the shading.
+
+`examples/groom.rs` does the same from the command line and exercises all three
+options, with `--bench N` for the table above:
 
 ```bash
 cargo run --release --example groom -- assets/straight.hair --strands 10000 \
-    --direct 3 --light --forward
+    --per-segment 3 --light --forward
+cargo run --release --example groom -- assets/wCurly.hair --light --bench 30
 ```
 
-It builds splats two ways. `--direct` places one splat per piece of strand,
-oriented by the segment's tangent and shaped like it; that is what
-"strand aligned" means, and it needs about 30x fewer splats than the other
-route. Without it the strands are built as ribbons and pushed through the normal
-mesh pipeline, which samples them on the conversion grid: the splats come out
-round and cell-sized, the strand direction is lost, and 10k strands blow past
-the 7M splat budget. Grooms are also modelled at their own scale (tens of
+It builds splats two ways. By default each strand segment becomes a splat
+oriented by its tangent and shaped like it; that is what "strand aligned" means,
+and it needs about 30x fewer splats than the other route. `--ribbons` instead
+builds ribbon geometry and pushes it through the normal mesh pipeline, which
+samples it on the conversion grid: the splats come out round and cell-sized, the
+strand direction is lost, and 10k strands blow past the 7M splat budget. Grooms are also modelled at their own scale (tens of
 units), so the example normalizes one into a 2-unit box — the renderer's near
 and far planes, shadow bias and gaussian scale all assume a unit-ish model.
 
@@ -275,6 +291,7 @@ src/
   scene.rs          glTF loading (node transforms baked, normals/tangents like the original)
   ply.rs            PLY writers (5 layouts) and reader (standard / PBR / compressed / PlayCanvas)
   camera.rs         fly camera (port of Camera.cpp) + Maya tumble / pan / dolly
+  hair.rs           .hair grooms and strand-aligned splats
   merge.rs          optional quadtree merge of alike neighbouring splats (CPU reference)
   cli.rs, main.rs   clap CLI
   app.rs            eframe/egui UI (port of ImGuiUI + GuiRendererConcreteMediator)

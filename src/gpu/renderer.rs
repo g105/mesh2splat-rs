@@ -60,6 +60,15 @@ pub struct RenderSettings {
     pub transmission: f32,
     /// Scales the accumulated opacity into optical depth.
     pub shadow_density: f32,
+    /// Colour left after light has travelled `attenuation_distance` worth of
+    /// splats (Beer-Lambert). White means transmitted light keeps its colour.
+    pub attenuation_color: Vec3,
+    /// Optical depth over which `attenuation_color` applies.
+    pub attenuation_distance: f32,
+    /// Use the occlusion baked into the splats (see [`super::ao::AoBaker`]).
+    /// Exact in the forward path; in the deferred path it folds into the
+    /// colour, which dims direct light too.
+    pub ambient_occlusion: bool,
     /// Shade every splat in the splat pass instead of once per pixel after it.
     /// Each splat uses its own normal and tangent, so overlapping strands blend
     /// as lit strands rather than as one averaged surface. Costs more, since
@@ -85,6 +94,9 @@ impl Default for RenderSettings {
             opacity_shadows: false,
             transmission: 0.5,
             shadow_density: 4.0,
+            attenuation_color: Vec3::new(0.85, 0.55, 0.35),
+            attenuation_distance: 1.0,
+            ambient_occlusion: true,
             forward_shading: false,
         }
     }
@@ -140,6 +152,8 @@ struct FrameUniform {
     depth_test: u32,
     sort_min: f32,
     sort_scale: f32,
+    ao_deferred: f32,
+    _p: [f32; 3],
 }
 
 #[repr(C)]
@@ -178,8 +192,9 @@ struct LightingUniform {
     forward: u32,
     transmission: f32,
     shadow_density: f32,
-    // WGSL rounds the struct up to a multiple of its 16-byte alignment.
+    // `attenuation` is a vec4 and so starts on a 16-byte boundary.
     _pad: u32,
+    attenuation: [f32; 4],
 }
 
 #[repr(C)]
@@ -1238,6 +1253,9 @@ impl Renderer {
             depth_test: depth_test as u32,
             sort_min,
             sort_scale,
+            // The forward path applies occlusion itself, to ambient only.
+            ao_deferred: (settings.ambient_occlusion && !settings.forward_shading) as u32 as f32,
+            _p: [0.0; 3],
         };
         ctx.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
@@ -1266,6 +1284,10 @@ impl Renderer {
             transmission: settings.transmission,
             shadow_density: settings.shadow_density,
             _pad: 0,
+            attenuation: settings
+                .attenuation_color
+                .extend(settings.attenuation_distance)
+                .to_array(),
         };
         ctx.queue
             .write_buffer(&self.lighting_buf, 0, bytemuck::bytes_of(&lighting_u));

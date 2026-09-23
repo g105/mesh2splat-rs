@@ -74,7 +74,7 @@ fn shadow_factor(pos: vec3<f32>) -> f32 {
 
 /// Light left after the splats between `pos` and the light absorbed their
 /// share (the opacity slices in front of the fragment).
-fn transmittance(pos: vec3<f32>) -> f32 {
+fn optical_depth(pos: vec3<f32>) -> f32 {
     let to_frag = pos - lt.light_pos.xyz;
     let dist = length(to_frag);
     let dir = to_frag / max(dist, 1e-6);
@@ -84,7 +84,7 @@ fn transmittance(pos: vec3<f32>) -> f32 {
     let res = i32(lt.shadow_res);
     let px = vec2<i32>(vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - 0.5 * ndc.y) * f32(res));
     let slices = textureLoad(opacity_map, clamp(px, vec2<i32>(0), vec2<i32>(res - 1)), i32(face), 0);
-    return slices_to_transmittance(slices, dist, lt.far_plane, lt.shadow_density);
+    return slices_to_optical_depth(slices, dist, lt.far_plane);
 }
 
 fn over_background(premul_rgb: vec3<f32>, alpha: f32) -> vec4<f32> {
@@ -138,10 +138,13 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // Graded (opacity) or binary (depth) self-shadowing.
     var shadow = 0.0;
     var through = 0.0;
+    var tint = vec3<f32>(1.0);
     if (lt.opacity_shadows == 1u) {
-        let t = transmittance(pos);
+        let optical = optical_depth(pos);
+        let t = exp(-lt.shadow_density * optical);
         shadow = 1.0 - t;
         through = t * lt.transmission;
+        tint = attenuation_tint(lt.attenuation.rgb, lt.attenuation.w, optical);
     } else {
         shadow = shadow_factor(pos);
     }
@@ -160,7 +163,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     lo *= radiance * (1.0 - shadow);
     // Light that came through the splats in front lights this one from behind.
     if (through > 0.0) {
-        lo += transmission_term(v, l, albedo, through) * radiance;
+        lo += transmission_term(v, l, albedo, through, tint) * radiance;
     }
     let color = tonemap(vec3<f32>(0.3) * albedo + lo);
     return over_background(color * alpha, alpha);

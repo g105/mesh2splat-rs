@@ -19,6 +19,9 @@ struct Lighting {
     forward: u32,            // splats shaded themselves
     transmission: f32,       // how much light comes through the splats
     shadow_density: f32,     // accumulated opacity -> optical depth
+    _p0: u32,
+    // rgb = colour left after `w` worth of optical depth (Beer-Lambert).
+    attenuation: vec4<f32>,
 };
 
 const PI: f32 = 3.14159265;
@@ -88,7 +91,8 @@ fn pbr_lighting(
 }
 
 /// Opacity shadow slices in front of a fragment -> how much light survives.
-fn slices_to_transmittance(slices: vec4<f32>, dist: f32, far_plane: f32, density: f32) -> f32 {
+/// Opacity accumulated in the slices in front of a fragment.
+fn slices_to_optical_depth(slices: vec4<f32>, dist: f32, far_plane: f32) -> f32 {
     let s = clamp(dist / far_plane, 0.0, 1.0) * 3.0;
     let k = floor(s);
     let frac = s - k;
@@ -97,13 +101,33 @@ fn slices_to_transmittance(slices: vec4<f32>, dist: f32, far_plane: f32, density
         let w = clamp(k - f32(i), 0.0, 1.0) + select(0.0, frac, f32(i) == k);
         optical += slices[i] * w;
     }
-    return exp(-density * optical);
+    return optical;
+}
+
+fn slices_to_transmittance(slices: vec4<f32>, dist: f32, far_plane: f32, density: f32) -> f32 {
+    return exp(-density * slices_to_optical_depth(slices, dist, far_plane));
+}
+
+/// Beer-Lambert through the splats in front: `attenuation` is the colour left
+/// after light travelled `distance` worth of them, so the tint deepens with
+/// optical depth. Blonde hair reddens towards the tips this way; dark hair
+/// simply stays dark.
+fn attenuation_tint(attenuation: vec3<f32>, distance: f32, optical: f32) -> vec3<f32> {
+    let depth = optical / max(distance, 1e-4);
+    return pow(max(attenuation, vec3<f32>(1e-4)), vec3<f32>(depth));
 }
 
 /// Light scattered forward through the splats in front, for backlit hair.
-fn transmission_term(v: vec3<f32>, l: vec3<f32>, albedo: vec3<f32>, through: f32) -> vec3<f32> {
+/// `tint` is what the splats in between left of it.
+fn transmission_term(
+    v: vec3<f32>,
+    l: vec3<f32>,
+    albedo: vec3<f32>,
+    through: f32,
+    tint: vec3<f32>,
+) -> vec3<f32> {
     let back = pow(clamp(dot(-v, l) * 0.5 + 0.5, 0.0, 1.0), 3.0);
-    return albedo * back * through;
+    return albedo * tint * back * through;
 }
 
 /// Tone map and gamma, shared so both paths match.

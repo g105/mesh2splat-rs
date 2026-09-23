@@ -115,7 +115,14 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>, @builtin(num_workgroups)
     let n_unit = normalize(decode_normal(normal_ws.xyz));
     let t_flat = normalize(tangent - n_unit * dot(tangent, n_unit));
     q.metal_rough = pack4x8unorm(vec4<f32>(g.pbr.xy, encode_tangent(n_unit, t_flat), 0.0));
-    q._pad = 0u;
+    // Baked occlusion (pbr.z) and bent normal (pbr.w); unbaked splats are
+    // fully open and bend along their own normal.
+    if (g.pbr.z > 0.0) {
+        let bent = oct_decode(unpack2x16unorm(bitcast<u32>(g.pbr.w)));
+        q.ao_bent = pack_ao_bent(bent, g.pbr.z);
+    } else {
+        q.ao_bent = pack_ao_bent(n_unit, 1.0);
+    }
     quads[idx] = q;
     if (frame.sort_scale > 0.0) {
         keys[idx] = u32(clamp((-vs.z - frame.sort_min) * frame.sort_scale, 0.0, 65535.0));

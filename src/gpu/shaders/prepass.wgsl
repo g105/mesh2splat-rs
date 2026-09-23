@@ -109,7 +109,13 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>, @builtin(num_workgroups)
     q.axes_ndc = vec2<u32>(pack2x16float(p.axes.xy * k), pack2x16float(p.axes.zw * k));
     q.ws_pos = ws.xyz;
     q.extent = pack2x16float(p.extent * k);
-    q.color = pack4x8unorm(color);
+    // Deferred shading has no spare G-buffer channel for occlusion, so fold it
+    // into the colour here rather than per fragment.
+    var out_color = color;
+    if (frame.ao_deferred > 0.0 && g.pbr.z > 0.0) {
+        out_color = vec4<f32>(color.rgb * g.pbr.z, color.a);
+    }
+    q.color = pack4x8unorm(out_color);
     q.normal = pack2x16unorm(oct_encode(normalize(decode_normal(normal_ws.xyz))));
     // .z carries the tangent as an angle in the plane of the normal.
     let n_unit = normalize(decode_normal(normal_ws.xyz));

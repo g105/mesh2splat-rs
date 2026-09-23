@@ -16,6 +16,8 @@
 //! scaled by the block size, which keeps the "Gaussian Scale" slider meaning
 //! "standard deviation relative to splat spacing".
 
+use std::collections::HashMap;
+
 use glam::{DMat3, DVec3, Mat3, Quat, Vec2, Vec3, Vec4};
 
 use crate::types::{BBox, GaussianVertex};
@@ -688,6 +690,87 @@ mod tests {
 }
 
 #[cfg(test)]
+mod volume_tests {
+    use super::*;
+
+    /// A block of splats: the ones away from the surface are marked occluded,
+    /// as the bake would.
+    fn block(n: i32) -> Vec<GaussianVertex> {
+        let mut v = Vec::new();
+        for z in -n..=n {
+            for y in -n..=n {
+                for x in -n..=n {
+                    let p = Vec3::new(x as f32, y as f32, z as f32) * 0.1;
+                    let edge = x.abs() == n || y.abs() == n || z.abs() == n;
+                    v.push(GaussianVertex {
+                        position: p.extend(1.0).to_array(),
+                        color: [0.5, 0.4, 0.3, 0.8],
+                        scale: [0.05, 0.02, 0.001, 0.0],
+                        normal: [0.0, 0.0, 1.0, 0.0],
+                        rotation: [1.0, 0.0, 0.0, 0.0],
+                        // Occlusion as the bake writes it: open at the surface.
+                        pbr: [0.0, 0.5, if edge { 0.9 } else { 0.1 }, 0.0],
+                    });
+                }
+            }
+        }
+        v
+    }
+
+    fn extinction_total(v: &[GaussianVertex]) -> f64 {
+        v.iter().map(extinction).sum()
+    }
+
+    #[test]
+    fn interior_splats_pool_and_the_shell_survives() {
+        let splats = block(4);
+        let shell = splats.iter().filter(|g| g.pbr[2] > 0.3).count();
+        let (out, stats) = merge_occluded(&splats, &VolumeMergeSettings::default());
+        assert_eq!(stats.input, splats.len());
+        assert!(out.len() < splats.len(), "nothing merged");
+        // Every shell splat is still there, untouched.
+        let kept = out.iter().filter(|g| g.pbr[2] > 0.3).count();
+        assert_eq!(kept, shell);
+        // And the volume still stops about as much light as it did.
+        let (before, after) = (extinction_total(&splats), extinction_total(&out));
+        assert!(
+            (after - before).abs() / before < 0.25,
+            "extinction {before:.4} -> {after:.4}"
+        );
+    }
+
+    #[test]
+    fn unbaked_splats_are_left_alone() {
+        let mut splats = block(3);
+        for g in &mut splats {
+            g.pbr[2] = 0.0; // never baked
+        }
+        let (out, stats) = merge_occluded(&splats, &VolumeMergeSettings::default());
+        assert_eq!(out.len(), splats.len());
+        assert_eq!(stats.output, splats.len());
+    }
+
+    #[test]
+    fn threshold_controls_how_much_is_pooled() {
+        let splats = block(4);
+        let count = |occlusion| {
+            merge_occluded(
+                &splats,
+                &VolumeMergeSettings {
+                    occlusion,
+                    ..Default::default()
+                },
+            )
+            .0
+            .len()
+        };
+        assert_eq!(count(0.0), splats.len());
+        assert!(count(0.5) < count(0.05));
+        assert!(count(1.0) <= count(0.5));
+    }
+}
+
+#[cfg(test)]
 mod axis_tests {
     use super::*;
 
@@ -725,4 +808,198 @@ mod axis_tests {
             assert!((shader_rot.col(i) - axes.col(i)).length() > 1e-3);
         }
     }
+}
+
+// --- occlusion-driven volume merge -------------------------------------------
+//
+// A groom's splat count is dominated by strands nobody can see: buried in the
+// volume, they contribute bulk opacity and colour but no silhouette and no
+// highlight. The occlusion bake already says which those are, so they can
+// collapse into a few coarse splats that fill the same volume and stop the same
+// amount of light, while the visible shell keeps its per-segment detail.
+
+/// Which splats count as interior, and how coarsely they are pooled.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VolumeMergeSettings {
+    /// Splats whose baked occlusion is at or below this are interior.
+    /// 0 merges nothing; 1 merges everything.
+    pub occlusion: f32,
+    /// Side of the pooling cell, in world units. `None` derives one from the
+    /// splats' own size.
+    pub cell: Option<f32>,
+    /// Leave clusters smaller than this alone: merging two splats saves little
+    /// and costs accuracy.
+    pub min_cluster: usize,
+}
+
+impl Default for VolumeMergeSettings {
+    fn default() -> Self {
+        Self {
+            occlusion: 0.3,
+            cell: None,
+            min_cluster: 4,
+        }
+    }
+}
+
+/// The two in-plane standard deviations of a splat, largest first.
+fn splat_face(scale: [f32; 4]) -> (f64, f64) {
+    let mut s = [scale[0] as f64, scale[1] as f64, scale[2] as f64];
+    s.sort_by(f64::total_cmp);
+    (s[2], s[1])
+}
+
+/// How much light a splat stops: opacity over its face.
+fn extinction(g: &GaussianVertex) -> f64 {
+    let (a, b) = splat_face(g.scale);
+    g.color[3] as f64 * std::f64::consts::PI * a * b
+}
+
+#[derive(Default)]
+struct Cluster {
+    count: usize,
+    weight: f64,
+    sum_p: DVec3,
+    /// Weighted sum of each splat's own covariance and its offset from the mean.
+    sum_cov: Sym,
+    sum_pp: Sym,
+    sum_color: [f64; 3],
+    sum_normal: DVec3,
+    sum_pbr: [f64; 2],
+    sum_ao: f64,
+    extinction: f64,
+    members: Vec<u32>,
+}
+
+/// Pool heavily occluded splats into coarse ones that fill the same volume and
+/// stop the same amount of light. Needs [`crate::gpu::ao::AoBaker`] to have run;
+/// without it every splat reads as fully occluded and nothing is merged.
+pub fn merge_occluded(
+    splats: &[GaussianVertex],
+    cfg: &VolumeMergeSettings,
+) -> (Vec<GaussianVertex>, MergeStats) {
+    let mut stats = MergeStats {
+        input: splats.len(),
+        output: splats.len(),
+        ..Default::default()
+    };
+    // `pbr.z` is 0 for splats that were never baked; treat that as "unknown"
+    // rather than "fully buried", or an unbaked cloud would collapse entirely.
+    if splats.iter().all(|g| g.pbr[2] <= 0.0) {
+        return (splats.to_vec(), stats);
+    }
+
+    // A cell a few splats wide: big enough to pool, small enough to keep the
+    // volume's shape.
+    let cell = cfg.cell.unwrap_or_else(|| {
+        let mean: f64 = splats
+            .iter()
+            .map(|g| splat_face(g.scale).0)
+            .sum::<f64>()
+            / splats.len().max(1) as f64;
+        (mean * 6.0) as f32
+    }) as f64;
+
+    // Far fewer cells than splats, so the default hasher is not worth replacing.
+    let mut clusters: HashMap<[i64; 3], Cluster> = HashMap::new();
+    let mut interior = vec![false; splats.len()];
+    for (i, g) in splats.iter().enumerate() {
+        if g.pbr[2] > cfg.occlusion {
+            continue;
+        }
+        interior[i] = true;
+        let p = DVec3::new(
+            g.position[0] as f64,
+            g.position[1] as f64,
+            g.position[2] as f64,
+        );
+        let key = [
+            (p.x / cell).floor() as i64,
+            (p.y / cell).floor() as i64,
+            (p.z / cell).floor() as i64,
+        ];
+        let w = extinction(g).max(1e-12);
+        let c = clusters.entry(key).or_default();
+        c.count += 1;
+        c.weight += w;
+        c.sum_p += p * w;
+        let cov = sym(shape_covariance(g) * w);
+        let pp = sym(DMat3::from_cols(p * p.x, p * p.y, p * p.z) * w);
+        for k in 0..6 {
+            c.sum_cov[k] += cov[k];
+            c.sum_pp[k] += pp[k];
+        }
+        for k in 0..3 {
+            c.sum_color[k] += g.color[k] as f64 * w;
+        }
+        c.sum_normal += DVec3::new(
+            g.normal[0] as f64,
+            g.normal[1] as f64,
+            g.normal[2] as f64,
+        ) * w;
+        c.sum_pbr[0] += g.pbr[0] as f64 * w;
+        c.sum_pbr[1] += g.pbr[1] as f64 * w;
+        c.sum_ao += g.pbr[2] as f64 * w;
+        c.extinction += extinction(g);
+        c.members.push(i as u32);
+    }
+
+    let mut merged = Vec::new();
+    for c in clusters.values() {
+        if c.count < cfg.min_cluster.max(2) {
+            continue;
+        }
+        let inv = 1.0 / c.weight;
+        let mean = c.sum_p * inv;
+        // The cluster's own spread plus each member's shape: a blob that fills
+        // the volume the strands occupied.
+        let spread = unsym(&c.sum_pp) * inv
+            - DMat3::from_cols(mean * mean.x, mean * mean.y, mean * mean.z);
+        let cov = unsym(&c.sum_cov) * inv + spread;
+        let (rotation, scale) = splat_from_covariance(cov);
+        // Keep the volume as opaque as the strands were: the coarse splat has a
+        // much bigger face, so it needs proportionally less opacity.
+        let (a, b) = splat_face([scale[0], scale[1], scale[2], 0.0]);
+        let area = std::f64::consts::PI * a * b;
+        let alpha = (c.extinction / area.max(1e-12)).clamp(0.0, 1.0);
+        let normal = c.sum_normal.normalize_or(DVec3::Z);
+        merged.push(GaussianVertex {
+            position: [mean.x as f32, mean.y as f32, mean.z as f32, 1.0],
+            color: [
+                (c.sum_color[0] * inv) as f32,
+                (c.sum_color[1] * inv) as f32,
+                (c.sum_color[2] * inv) as f32,
+                alpha as f32,
+            ],
+            scale: [scale[0], scale[1], scale[2], f32::from_bits(NO_GRID)],
+            normal: [normal.x as f32, normal.y as f32, normal.z as f32, 0.0],
+            rotation,
+            pbr: [
+                (c.sum_pbr[0] * inv) as f32,
+                (c.sum_pbr[1] * inv) as f32,
+                (c.sum_ao * inv) as f32,
+                0.0,
+            ],
+        });
+        for m in &c.members {
+            interior[*m as usize] = false; // consumed
+        }
+    }
+
+    let mut out: Vec<GaussianVertex> = splats
+        .iter()
+        .enumerate()
+        .filter(|(i, g)| g.pbr[2] > cfg.occlusion || !was_merged(&interior, *i))
+        .map(|(_, g)| *g)
+        .collect();
+    let clustered = merged.len();
+    out.extend(merged);
+    stats.output = out.len();
+    stats.merged_per_level = vec![clustered];
+    (out, stats)
+}
+
+/// A splat is gone only if it joined a cluster that was actually merged.
+fn was_merged(interior: &[bool], i: usize) -> bool {
+    !interior[i]
 }

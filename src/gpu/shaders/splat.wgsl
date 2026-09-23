@@ -84,8 +84,8 @@ fn fs_main(in: VsOut) -> GBufferOut {
     if (frame.render_mode == 4u) {
         out.albedo = vec4<f32>(0.01, 0.005, 0.0, 0.01);
     } else {
-        let ao = mix(1.0, unpack_ao(in.packed.w), frame.ao_deferred);
-        out.albedo = vec4<f32>(color.rgb * ao * opacity, opacity) * g;
+        // Occlusion was folded into the colour in the prepass, once per splat.
+        out.albedo = vec4<f32>(color.rgb * opacity, opacity) * g;
     }
     out.position = vec4<f32>(in.ws_pos, 1.0) * g;
     // Premultiply by opacity so rgb / a in the deferred pass is an opacity-weighted

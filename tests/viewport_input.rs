@@ -39,7 +39,7 @@ fn drag_delta(modifiers: Modifiers, with_gizmo: bool) -> Drag {
             response: Vec2::ZERO,
             pointer: Vec2::ZERO,
         };
-        ctx.run(input, |ctx| {
+        let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let rect = ui.max_rect();
                 let response = ui.allocate_rect(rect, Sense::click_and_drag());

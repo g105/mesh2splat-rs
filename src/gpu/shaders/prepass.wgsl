@@ -49,6 +49,15 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>, @builtin(num_workgroups)
     let rot = cast_quat_to_mat3(g.rotation) * inv_rot;
     let cov3d = compute_cov3d(rot, scale);
 
+    // Longest axis: the strand / fibre direction, for anisotropic shading.
+    var max_idx = 0u;
+    if (g.scale.y > g.scale.x && g.scale.y >= g.scale.z) {
+        max_idx = 1u;
+    } else if (g.scale.z > g.scale.x && g.scale.z > g.scale.y) {
+        max_idx = 2u;
+    }
+    let tangent = splat_axis(rot, max_idx);
+
     var normal_ws = vec4<f32>(1.0, 0.0, 0.0, 0.0);
     if (frame.format == 0u || frame.ply_has_pbr != 0u) {
         let n = (frame.normal_matrix * vec4<f32>(g.normal.xyz, 1.0)).xyz;
@@ -102,7 +111,10 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>, @builtin(num_workgroups)
     q.extent = pack2x16float(p.extent * k);
     q.color = pack4x8unorm(color);
     q.normal = pack2x16unorm(oct_encode(normalize(decode_normal(normal_ws.xyz))));
-    q.metal_rough = pack4x8unorm(vec4<f32>(g.pbr.xy, 0.0, 0.0));
+    // .z carries the tangent as an angle in the plane of the normal.
+    let n_unit = normalize(decode_normal(normal_ws.xyz));
+    let t_flat = normalize(tangent - n_unit * dot(tangent, n_unit));
+    q.metal_rough = pack4x8unorm(vec4<f32>(g.pbr.xy, encode_tangent(n_unit, t_flat), 0.0));
     q._pad = 0u;
     quads[idx] = q;
     if (frame.sort_scale > 0.0) {

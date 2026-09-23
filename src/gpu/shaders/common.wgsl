@@ -91,6 +91,28 @@ fn splat_axis(rot: mat3x3<f32>, i: u32) -> vec3<f32> {
     return normalize(vec3<f32>(rot[0][i], rot[1][i], rot[2][i]));
 }
 
+/// Any orthonormal pair perpendicular to `n`, chosen the same way everywhere
+/// so a direction in that plane can be stored as a single angle.
+fn plane_basis(n: vec3<f32>) -> mat2x3<f32> {
+    let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.z) > 0.9);
+    let b0 = normalize(cross(up, n));
+    return mat2x3<f32>(b0, cross(n, b0));
+}
+
+/// Direction in the plane of `n` -> [0, 1). Hair tangents are unsigned, so the
+/// angle folds at pi and 8 bits are enough for ~0.7 degrees.
+fn encode_tangent(n: vec3<f32>, t: vec3<f32>) -> f32 {
+    let b = plane_basis(n);
+    let a = atan2(dot(t, b[1]), dot(t, b[0]));
+    return fract(select(a, a + 3.14159265, a < 0.0) / 3.14159265);
+}
+
+fn decode_tangent(n: vec3<f32>, angle: f32) -> vec3<f32> {
+    let b = plane_basis(n);
+    let a = angle * 3.14159265;
+    return normalize(b[0] * cos(a) + b[1] * sin(a));
+}
+
 fn compute_cov3d(rot: mat3x3<f32>, s: vec3<f32>) -> mat3x3<f32> {
     let sm = mat3x3<f32>(s.x, 0.0, 0.0, 0.0, s.y, 0.0, 0.0, 0.0, s.z);
     let m = sm * rot;

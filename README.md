@@ -59,6 +59,48 @@ so nothing has to be merged away afterwards — which matters mainly at high
 sampling density. Both are off by default; **merging is the better first
 choice.**
 
+### Hair, fur and other fibres
+
+Optional, and not in the original. Splats converted from a mesh are flat and
+roughly round, but splats that follow a strand are long and thin, and shading
+them as surfaces reads as felt. Three settings (all off by default) target that:
+
+* **Anisotropic (hair) shading** — Kajiya-Kay: both the diffuse and the two
+  specular lobes work off the angle to each splat's longest axis instead of its
+  normal. The tangent rides through the G-buffer as an angle in the plane of the
+  normal, packed into a channel that was previously written as zero.
+* **Opacity shadows** — the shadow pass already rasterizes splats from the
+  light, so instead of keeping only the nearest depth it accumulates how much
+  light each splat absorbs into four distance slices. Self-shadowing becomes
+  graded rather than binary, and the optical depth drives **transmission**, the
+  light that reaches a splat through the ones in front of it.
+* **Forward (per-splat) shading** — shade in the splat pass instead of once per
+  pixel afterwards, so overlapping strands blend as lit strands rather than as
+  one averaged surface, each using its own normal and tangent. Sharper
+  highlights on fine geometry, at the cost of shading per fragment instead of
+  per pixel; with hair's overdraw that is a real cost.
+
+`examples/groom.rs` converts a hair groom in Cem Yuksel's `.hair` strand format
+and exercises all three:
+
+```bash
+cargo run --release --example groom -- assets/straight.hair --strands 10000 \
+    --direct 3 --light --forward
+```
+
+It builds splats two ways. `--direct` places one splat per piece of strand,
+oriented by the segment's tangent and shaped like it; that is what
+"strand aligned" means, and it needs about 30x fewer splats than the other
+route. Without it the strands are built as ribbons and pushed through the normal
+mesh pipeline, which samples them on the conversion grid: the splats come out
+round and cell-sized, the strand direction is lost, and 10k strands blow past
+the 7M splat budget. Grooms are also modelled at their own scale (tens of
+units), so the example normalizes one into a 2-unit box — the renderer's near
+and far planes, shadow bias and gaussian scale all assume a unit-ish model.
+
+Hair models come from https://www.cemyuksel.com/research/hairmodels (free for
+personal and research use, attribution requested).
+
 ### Merging similar splats
 
 Optional, and not in the original. After conversion, blocks of 2x2 neighbouring
@@ -128,7 +170,7 @@ The side panel mirrors the original's ImGui windows:
 
   The PlayCanvas layout groups splats into chunks of 256 that store the min/max of their positions, log-scales and colours; each splat is then four 32-bit words (position and scale 11/10/11 bits inside the chunk, rotation as smallest-three, 8-bit RGBA). It drops normals and PBR, so it is an export format for viewers rather than a round-trip for relighting. mesh2splat reads it back as well; on DamagedHelmet the round trip is 46 dB PSNR.
 * **Properties** — visualization mode (Final, Albedo, Depth, Normals, Geometry, Overdraw, PBR), mesh/gaussian depth test, gaussian scale, sampling density (16 up to 1024/2048/4096 px), projection box, **Detail-aware density** and **Merge similar splats** (see below), background color and split-screen.
-* **Lighting** — point light with intensity, color and a cube shadow map.
+* **Lighting** — point light with intensity, color and a cube shadow map, plus the fibre options below.
 * **Camera** — switch between the original fly controls and Maya-style controls, and frame the model.
 * **Gizmo** — translate, rotate or scale the model or the light (local or world axes), and set the on-screen gizmo size (`+` / `-` / `0` in the viewport).
 * **Batch conversion** — pick a folder of meshes, optionally including subfolders, and convert them all.
@@ -238,6 +280,7 @@ src/
   app.rs            eframe/egui UI (port of ImGuiUI + GuiRendererConcreteMediator)
   gpu/
     converter.rs    ConversionPass (one pass per sampling level)
+    shaders/lighting.wgsl  shading shared by the deferred and forward paths
     scene.rs        vertex buffers, textures (CPU mip chain), per-mesh bind groups
     sort.rs         GPU radix sort (replaces gl-radix-sort)
     merge.rs        GPU version of the splat merge

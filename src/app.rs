@@ -783,6 +783,16 @@ impl App {
                     self.gizmo_target = GizmoTarget::Model;
                 }
                 if self.settings.lighting {
+                    ui.checkbox(&mut self.settings.hair_shading, "Anisotropic (hair) shading")
+                        .on_hover_text("Kajiya-Kay: shade along each splat's longest axis instead of its normal. For hair, fur and other fibres, where the splats are long and thin.");
+                    ui.checkbox(&mut self.settings.opacity_shadows, "Opacity shadows")
+                        .on_hover_text("Shadow from how much opacity is between here and the light, instead of a binary depth test: graded self-shadowing, and light can come through thin parts.");
+                    if self.settings.opacity_shadows {
+                        ui.add(egui::Slider::new(&mut self.settings.shadow_density, 0.0..=20.0).text("Shadow density"));
+                        ui.add(egui::Slider::new(&mut self.settings.transmission, 0.0..=2.0).text("Transmission"));
+                    }
+                    ui.checkbox(&mut self.settings.forward_shading, "Forward (per-splat) shading")
+                        .on_hover_text("Shade every splat in the splat pass instead of once per pixel afterwards, so overlapping splats blend as lit surfaces. Slower: shading runs per fragment.");
                     ui.add(egui::Slider::new(&mut self.settings.light_intensity, 0.0..=1000.0).logarithmic(true).text("Light intensity"));
                     let mut c = self.settings.light_color.to_array();
                     ui.horizontal(|ui| {

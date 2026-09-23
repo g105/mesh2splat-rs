@@ -142,6 +142,30 @@ and far planes, shadow bias and gaussian scale all assume a unit-ish model.
 Hair models come from https://www.cemyuksel.com/research/hairmodels (free for
 personal and research use, attribution requested).
 
+### Pooling buried splats
+
+A groom's splat count is dominated by strands nobody can see. A strand buried in
+the volume contributes bulk opacity and colour but no silhouette and no
+highlight, and the occlusion bake already says which those are. `merge_occluded`
+pools them by cell into coarse splats that fill the same volume and stop the
+same amount of light — the merged splat's opacity is set so that opacity times
+area is preserved — while everything above the occlusion threshold keeps its
+per-segment detail.
+
+On the curly groom (3.4 M strand splats, 1600x1200, PSNR against the unpooled
+render):
+
+| threshold | splats | PSNR | frame |
+|---|---|---|---|
+| none | 3.39 M | reference | 777 ms |
+| 0.2 | 760 k (4.5x fewer) | 43 dB | 147 ms |
+| 0.35 | 294 k (11.5x fewer) | 30 dB | — |
+
+4.5x fewer splats at 43 dB is a better trade than the grid merge below ever
+managed, because it spends detail where it shows. Above ~0.35 the coarse blobs
+start showing through thin parts of the shell as soft patches. It needs the
+occlusion bake first, and the button says so.
+
 ### Merging similar splats
 
 Optional, and not in the original. After conversion, blocks of 2x2 neighbouring

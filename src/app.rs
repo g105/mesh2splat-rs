@@ -16,7 +16,7 @@ use transform_gizmo_egui::{
 
 use crate::camera::{Camera, CameraKeys};
 use crate::gpu::converter::{resolution_from_quality, ConversionStats, DetailSettings};
-use crate::merge::MergeSettings;
+use crate::merge::{merge_occluded, MergeSettings, VolumeMergeSettings};
 use crate::gpu::renderer::OUTPUT_FORMAT;
 use crate::gpu::ao::{AoBaker, AoSettings};
 use crate::gpu::{
@@ -247,6 +247,7 @@ pub struct App {
     ao_settings: AoSettings,
     /// Splats the occlusion was baked for, so the UI can say it is stale.
     ao_generation: Option<u64>,
+    volume_merge: VolumeMergeSettings,
     /// Loaded hair groom, kept so the strand settings can rebuild its splats.
     groom: Option<Box<Groom>>,
     groom_strands: usize,
@@ -348,6 +349,7 @@ impl App {
             ao_baker: None,
             ao_settings: AoSettings::default(),
             ao_generation: None,
+            volume_merge: VolumeMergeSettings::default(),
             groom: None,
             groom_strands: 20000,
             groom_splats: StrandSplats::default(),
@@ -879,6 +881,12 @@ impl App {
                             (true, false) => "baked".to_string(),
                         });
                     });
+                    ui.horizontal(|ui| {
+                        if ui.button("Merge buried splats").on_hover_text("Splats the bake found buried contribute bulk opacity but no silhouette: pool them into coarse splats that fill the same volume and stop the same amount of light. The visible shell keeps its detail.").clicked() {
+                            self.merge_occluded_splats();
+                        }
+                        ui.add(egui::Slider::new(&mut self.volume_merge.occlusion, 0.0..=0.8).text("below occlusion"));
+                    });
                     ui.checkbox(&mut self.settings.ambient_occlusion, "Use baked occlusion")
                         .on_hover_text("Ambient light reaches a splat only as far as the bake says it is open. Exact with forward shading; the deferred path folds it into the colour, which dims direct light too.");
                     ui.add(egui::Slider::new(&mut self.ao_settings.density, 0.1..=4.0).text("Occlusion density"));
@@ -1014,6 +1022,29 @@ impl App {
             format!(
                 "Baked occlusion for {} splats in {:.0} ms",
                 fmt_thousands(self.gaussians.count as u64),
+                start.elapsed().as_secs_f64() * 1e3
+            ),
+            false,
+        );
+    }
+
+    /// Pool the splats the bake found buried into coarse volume-filling ones.
+    fn merge_occluded_splats(&mut self) {
+        if self.ao_generation != Some(self.gaussians.generation) {
+            self.set_status("Bake occlusion first: the merge needs it", true);
+            return;
+        }
+        let start = Instant::now();
+        let splats = self.gaussians.download(&self.ctx);
+        let (merged, stats) = merge_occluded(&splats, &self.volume_merge);
+        self.gaussians.upload_ply(&self.ctx, &merged, false);
+        self.ao_generation = Some(self.gaussians.generation);
+        self.set_status(
+            format!(
+                "Pooled buried splats: {} -> {} ({:.1}x fewer) in {:.0} ms",
+                fmt_thousands(stats.input as u64),
+                fmt_thousands(stats.output as u64),
+                stats.input as f64 / stats.output.max(1) as f64,
                 start.elapsed().as_secs_f64() * 1e3
             ),
             false,

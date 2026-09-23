@@ -155,6 +155,7 @@ struct Args {
     std: f32,
     bench: usize,
     no_ao: bool,
+    merge_occluded: Option<f32>,
     out: PathBuf,
 }
 
@@ -175,6 +176,7 @@ fn parse_args() -> Result<Args> {
         std: 0.65,
         bench: 0,
         no_ao: false,
+        merge_occluded: None,
         out: "target/groom".into(),
     };
     let mut it = std::env::args().skip(1);
@@ -195,6 +197,7 @@ fn parse_args() -> Result<Args> {
             "--std" => a.std = val()?.parse()?,
             "--bench" => a.bench = val()?.parse()?,
             "--no-ao" => a.no_ao = true,
+            "--merge-occluded" => a.merge_occluded = Some(val()?.parse()?),
             "--out" => a.out = val()?.into(),
             _ => a.file = arg.into(),
         }
@@ -290,9 +293,38 @@ fn main() -> Result<()> {
         ctx.wait_idle();
         println!("baked occlusion in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
     }
+    if let Some(occlusion) = args.merge_occluded {
+        // Interior strands only carry bulk opacity: pool them into coarse
+        // splats and leave the visible shell alone.
+        let splats = gb.download(&ctx);
+        let t = std::time::Instant::now();
+        let (merged, stats) = mesh2splat::merge::merge_occluded(
+            &splats,
+            &mesh2splat::merge::VolumeMergeSettings {
+                occlusion,
+                ..Default::default()
+            },
+        );
+        gb.upload_ply(&ctx, &merged, false);
+        println!(
+            "occlusion merge: {} -> {} splats ({:.2}x fewer, {} clusters) in {:.1} ms",
+            stats.input,
+            stats.output,
+            stats.input as f64 / stats.output.max(1) as f64,
+            stats.merged_per_level.first().copied().unwrap_or(0),
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
     let splats = gb.download(&ctx);
     let mean_ao = splats.iter().map(|g| g.pbr[2] as f64).sum::<f64>() / splats.len().max(1) as f64;
     println!("mean occlusion {:.2} (1 = fully open)", mean_ao);
+    let widths: Vec<f32> = splats.iter().map(|g| g.scale[1] * 2.0).collect();
+    let mean_width = widths.iter().sum::<f32>() / widths.len().max(1) as f32;
+    let max_width = widths.iter().copied().fold(0.0f32, f32::max);
+    println!(
+        "splat width: mean {:.4}, max {:.4} (per-point thickness from the file)",
+        mean_width, max_width
+    );
     println!(
         "median in-plane anisotropy: {:.2}x (1 = round, higher = strand shaped)",
         median_anisotropy(&splats)
@@ -370,6 +402,7 @@ fn main() -> Result<()> {
                     ..settings.clone()
                 };
                 let (mut frame, mut raster) = (vec![], vec![]);
+                let (mut pre, mut sort) = (vec![], vec![]);
                 for f in 0..args.bench + 5 {
                     let mut enc = ctx.device.create_command_encoder(&Default::default());
                     renderer.render(&ctx, &mut enc, cam, &s, &gb, gpu.as_ref(), (1600, 1200));
@@ -383,6 +416,15 @@ fn main() -> Result<()> {
                     let st = renderer.stats();
                     frame.extend(st.gpu_ms);
                     raster.extend(st.stages.map(|s| s.splat));
+                    pre.extend(st.stages.map(|s| s.prepass));
+                    sort.extend(st.stages.map(|s| s.sort));
+                }
+                if i == 0 {
+                    println!(
+                        "  {name}: prepass {:.1} ms, sort {:.1} ms",
+                        median(&mut pre),
+                        median(&mut sort)
+                    );
                 }
                 times[i] = (median(&mut frame), median(&mut raster));
             }

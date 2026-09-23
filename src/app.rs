@@ -16,7 +16,8 @@ use transform_gizmo_egui::{
 
 use crate::camera::{Camera, CameraKeys};
 use crate::gpu::converter::{resolution_from_quality, ConversionStats, DetailSettings};
-use crate::merge::{merge_occluded, MergeSettings, VolumeMergeSettings};
+use crate::gpu::pool::GpuPooler;
+use crate::merge::{MergeSettings, VolumeMergeSettings};
 use crate::gpu::renderer::OUTPUT_FORMAT;
 use crate::gpu::ao::{AoBaker, AoSettings};
 use crate::gpu::{
@@ -248,6 +249,7 @@ pub struct App {
     /// Splats the occlusion was baked for, so the UI can say it is stale.
     ao_generation: Option<u64>,
     volume_merge: VolumeMergeSettings,
+    pooler: Option<GpuPooler>,
     /// Loaded hair groom, kept so the strand settings can rebuild its splats.
     groom: Option<Box<Groom>>,
     groom_strands: usize,
@@ -350,6 +352,7 @@ impl App {
             ao_settings: AoSettings::default(),
             ao_generation: None,
             volume_merge: VolumeMergeSettings::default(),
+            pooler: None,
             groom: None,
             groom_strands: 20000,
             groom_splats: StrandSplats::default(),
@@ -1035,9 +1038,15 @@ impl App {
             return;
         }
         let start = Instant::now();
-        let splats = self.gaussians.download(&self.ctx);
-        let (merged, stats) = merge_occluded(&splats, &self.volume_merge);
-        self.gaussians.upload_ply(&self.ctx, &merged, false);
+        let bounds = self.model_bbox();
+        let pooler = self.pooler.get_or_insert_with(|| GpuPooler::new(&self.ctx));
+        let (buffer, count, stats) =
+            pooler.run(&self.ctx, &self.gaussians, &bounds, &self.volume_merge);
+        self.ctx.wait_idle();
+        self.gaussians.buffer = buffer;
+        self.gaussians.count = count;
+        self.gaussians.capacity = count.max(1);
+        self.gaussians.generation += 1;
         self.ao_generation = Some(self.gaussians.generation);
         self.set_status(
             format!(

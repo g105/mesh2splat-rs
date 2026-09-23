@@ -156,6 +156,7 @@ struct Args {
     bench: usize,
     no_ao: bool,
     merge_occluded: Option<f32>,
+    cpu_pool: bool,
     out: PathBuf,
 }
 
@@ -177,6 +178,7 @@ fn parse_args() -> Result<Args> {
         bench: 0,
         no_ao: false,
         merge_occluded: None,
+        cpu_pool: false,
         out: "target/groom".into(),
     };
     let mut it = std::env::args().skip(1);
@@ -198,6 +200,7 @@ fn parse_args() -> Result<Args> {
             "--bench" => a.bench = val()?.parse()?,
             "--no-ao" => a.no_ao = true,
             "--merge-occluded" => a.merge_occluded = Some(val()?.parse()?),
+            "--cpu-pool" => a.cpu_pool = true,
             "--out" => a.out = val()?.into(),
             _ => a.file = arg.into(),
         }
@@ -296,23 +299,36 @@ fn main() -> Result<()> {
     if let Some(occlusion) = args.merge_occluded {
         // Interior strands only carry bulk opacity: pool them into coarse
         // splats and leave the visible shell alone.
-        let splats = gb.download(&ctx);
+        let cfg = mesh2splat::merge::VolumeMergeSettings {
+            occlusion,
+            ..Default::default()
+        };
+        // Build the pipelines before timing: that is shader compilation, not work.
+        let mut pooler = (!args.cpu_pool).then(|| mesh2splat::gpu::pool::GpuPooler::new(&ctx));
         let t = std::time::Instant::now();
-        let (merged, stats) = mesh2splat::merge::merge_occluded(
-            &splats,
-            &mesh2splat::merge::VolumeMergeSettings {
-                occlusion,
-                ..Default::default()
-            },
-        );
-        gb.upload_ply(&ctx, &merged, false);
+        let stats = if args.cpu_pool {
+            let splats = gb.download(&ctx);
+            let (merged, stats) = mesh2splat::merge::merge_occluded(&splats, &cfg);
+            gb.upload_ply(&ctx, &merged, false);
+            stats
+        } else {
+            let (buffer, count, stats) =
+                pooler.as_mut().unwrap().run(&ctx, &gb, &bbox, &cfg);
+            gb.buffer = buffer;
+            gb.count = count;
+            gb.capacity = count.max(1);
+            gb.generation += 1;
+            ctx.wait_idle();
+            stats
+        };
         println!(
-            "occlusion merge: {} -> {} splats ({:.2}x fewer, {} clusters) in {:.1} ms",
+            "occlusion merge: {} -> {} splats ({:.2}x fewer, {} clusters) in {:.1} ms on the {}",
             stats.input,
             stats.output,
             stats.input as f64 / stats.output.max(1) as f64,
             stats.merged_per_level.first().copied().unwrap_or(0),
-            t.elapsed().as_secs_f64() * 1e3
+            t.elapsed().as_secs_f64() * 1e3,
+            if stats.gpu { "GPU" } else { "CPU" }
         );
     }
     let splats = gb.download(&ctx);

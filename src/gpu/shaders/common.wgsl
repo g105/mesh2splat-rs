@@ -82,6 +82,84 @@ fn oct_decode(e: vec2<f32>) -> vec3<f32> {
     return normalize(n);
 }
 
+struct Eigen {
+    values: vec3<f32>,
+    vectors: mat3x3<f32>, // columns
+};
+
+// Cyclic Jacobi for a symmetric 3x3 (Numerical Recipes' rotation formulas).
+fn eigen_sym(m: mat3x3<f32>) -> Eigen {
+    var a = array<vec3<f32>, 3>(m[0], m[1], m[2]);
+    var v = array<vec3<f32>, 3>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0));
+    let scale = max(max(abs(m[0][0]), abs(m[1][1])), max(abs(m[2][2]), 1e-30));
+    for (var sweep = 0u; sweep < 8u; sweep++) {
+        let off = abs(a[0][1]) + abs(a[0][2]) + abs(a[1][2]);
+        if (off <= 1e-7 * scale) {
+            break;
+        }
+        for (var pair = 0u; pair < 3u; pair++) {
+            // pairs (0,1) (0,2) (1,2)
+            let p = select(0u, 1u, pair == 2u);
+            let q = select(pair + 1u, 2u, pair == 2u);
+            let apq = a[p][q];
+            if (abs(apq) <= 1e-30) {
+                continue;
+            }
+            let theta = (a[q][q] - a[p][p]) / (2.0 * apq);
+            var t = 1.0;
+            if (theta != 0.0) {
+                t = sign(theta) / (abs(theta) + sqrt(theta * theta + 1.0));
+            }
+            let c = 1.0 / sqrt(t * t + 1.0);
+            let s = t * c;
+            let tau = s / (1.0 + c);
+            let r = 3u - p - q;
+            let arp = a[r][p];
+            let arq = a[r][q];
+            a[p][p] -= t * apq;
+            a[q][q] += t * apq;
+            a[p][q] = 0.0;
+            a[q][p] = 0.0;
+            a[r][p] = arp - s * (arq + tau * arp);
+            a[p][r] = a[r][p];
+            a[r][q] = arq + s * (arp - tau * arq);
+            a[q][r] = a[r][q];
+            // v[col][row]: eigenvector k is v[k].
+            let vp = v[p];
+            let vq = v[q];
+            v[p] = vp - s * (vq + tau * vp);
+            v[q] = vq + s * (vp - tau * vq);
+        }
+    }
+    var e: Eigen;
+    e.values = vec3<f32>(a[0][0], a[1][1], a[2][2]);
+    e.vectors = mat3x3<f32>(v[0], v[1], v[2]);
+    return e;
+}
+
+// GLM quat_cast (same as convert.wgsl). Returns (x, y, z, w).
+fn quat_cast(m: mat3x3<f32>) -> vec4<f32> {
+    let fx = m[0][0] - m[1][1] - m[2][2];
+    let fy = m[1][1] - m[0][0] - m[2][2];
+    let fz = m[2][2] - m[0][0] - m[1][1];
+    let fw = m[0][0] + m[1][1] + m[2][2];
+    var idx = 0;
+    var big = fw;
+    if (fx > big) { big = fx; idx = 1; }
+    if (fy > big) { big = fy; idx = 2; }
+    if (fz > big) { big = fz; idx = 3; }
+    let v = sqrt(big + 1.0) * 0.5;
+    let mult = 0.25 / v;
+    if (idx == 0) {
+        return vec4<f32>((m[1][2] - m[2][1]) * mult, (m[2][0] - m[0][2]) * mult, (m[0][1] - m[1][0]) * mult, v);
+    } else if (idx == 1) {
+        return vec4<f32>(v, (m[0][1] + m[1][0]) * mult, (m[2][0] + m[0][2]) * mult, (m[1][2] - m[2][1]) * mult);
+    } else if (idx == 2) {
+        return vec4<f32>((m[0][1] + m[1][0]) * mult, v, (m[1][2] + m[2][1]) * mult, (m[2][0] - m[0][2]) * mult);
+    }
+    return vec4<f32>((m[2][0] + m[0][2]) * mult, (m[1][2] + m[2][1]) * mult, v, (m[0][1] - m[1][0]) * mult);
+}
+
 fn random2d(co: vec2<f32>) -> f32 {
     let dt = dot(co, vec2<f32>(12.9898, 78.233));
     let sn = dt - 3.14 * floor(dt / 3.14);

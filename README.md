@@ -166,6 +166,13 @@ managed, because it spends detail where it shows. Above ~0.35 the coarse blobs
 start showing through thin parts of the shell as soft patches. It needs the
 occlusion bake first, and the button says so.
 
+Pooling runs on the GPU (`src/gpu/pool.rs`): rather than accumulate per cell
+with atomics — WGSL has no float atomics — it keys each buried splat by its
+cell, sorts with the renderer's radix sorter, and gives one thread each run of
+equal keys, which accumulates its whole cluster in registers. 3.4 M splats pool
+in ~290 ms against ~790 ms for the CPU version in `src/merge.rs`, which stays as
+the reference and the fallback.
+
 ### Merging similar splats
 
 Optional, and not in the original. After conversion, blocks of 2x2 neighbouring
@@ -349,6 +356,7 @@ src/
     shaders/lighting.wgsl  shading shared by the deferred and forward paths
     scene.rs        vertex buffers, textures (CPU mip chain), per-mesh bind groups
     ao.rs           bakes occlusion and a bent normal into the splats
+    pool.rs         pools buried splats into coarse volume-filling ones
     sort.rs         GPU radix sort (replaces gl-radix-sort)
     merge.rs        GPU version of the splat merge
     renderer.rs     all render passes, uniforms, G-buffers, readback

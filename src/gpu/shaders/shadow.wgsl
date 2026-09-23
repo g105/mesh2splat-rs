@@ -6,6 +6,8 @@ struct ShadowQuad {
     mean_ndc: vec4<f32>,
     axes_ndc: vec4<f32>,
     ws_pos: vec4<f32>,
+    /// xy = half-axes in standard deviations, z = opacity
+    shape: vec4<f32>,
 };
 
 struct ShadowFrame {
@@ -80,6 +82,7 @@ fn project(@builtin(global_invocation_id) gid3: vec3<u32>, @builtin(num_workgrou
     q.mean_ndc = vec4<f32>(clip_pos.xyz / clip_pos.w, 1.0);
     q.axes_ndc = p.axes;
     q.ws_pos = ws;
+    q.shape = vec4<f32>(p.extent, g.color.a, 0.0);
     squads[gid] = q;
     let slot = atomicAdd(&face_counts[face], 1u);
     face_slot[gid] = face | (slot << 3u);

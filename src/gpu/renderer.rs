@@ -24,6 +24,8 @@ const NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const ALBEDO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const MR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// Opacity shadow map slices (four distance bands of absorbed light).
+const OSM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Final image. Holds gamma-encoded values (like the original's default framebuffer).
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
@@ -47,6 +49,22 @@ pub struct RenderSettings {
     pub split_screen: bool,
     /// 0 = all mesh, 1 = all splats.
     pub split_position: f32,
+    /// Shade with an anisotropic hair model (Kajiya-Kay) along each splat's
+    /// longest axis, instead of the normal-based PBR model.
+    pub hair_shading: bool,
+    /// Shadow from accumulated opacity instead of a binary depth test, which
+    /// gives graded self-shadowing and drives the transmission term.
+    pub opacity_shadows: bool,
+    /// How much light reaches through the splats between here and the light
+    /// (needs `opacity_shadows`). 0 = opaque.
+    pub transmission: f32,
+    /// Scales the accumulated opacity into optical depth.
+    pub shadow_density: f32,
+    /// Shade every splat in the splat pass instead of once per pixel after it.
+    /// Each splat uses its own normal and tangent, so overlapping strands blend
+    /// as lit strands rather than as one averaged surface. Costs more, since
+    /// shading runs per fragment.
+    pub forward_shading: bool,
 }
 
 impl Default for RenderSettings {
@@ -63,6 +81,11 @@ impl Default for RenderSettings {
             background: [0.0, 0.0, 0.0, 1.0],
             split_screen: false,
             split_position: 0.5,
+            hair_shading: false,
+            opacity_shadows: false,
+            transmission: 0.5,
+            shadow_density: 4.0,
+            forward_shading: false,
         }
     }
 }
@@ -150,7 +173,13 @@ struct LightingUniform {
     lighting: u32,
     split_enabled: u32,
     shadow_res: u32,
-    _pad: [u32; 2],
+    hair: u32,
+    opacity_shadows: u32,
+    forward: u32,
+    transmission: f32,
+    shadow_density: f32,
+    // WGSL rounds the struct up to a multiple of its 16-byte alignment.
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -302,6 +331,9 @@ pub struct Renderer {
 
     prepass: wgpu::ComputePipeline,
     splat: wgpu::RenderPipeline,
+    splat_forward: wgpu::RenderPipeline,
+    splat_light_bgl: wgpu::BindGroupLayout,
+    splat_light_bg: Option<wgpu::BindGroup>,
     splat_overdraw: wgpu::RenderPipeline,
     mesh_gbuffer: wgpu::RenderPipeline,
     mesh_depth: wgpu::RenderPipeline,
@@ -321,6 +353,10 @@ pub struct Renderer {
 
     _shadow_tex: wgpu::Texture,
     shadow_layers: Vec<wgpu::TextureView>,
+    _osm_tex: wgpu::Texture,
+    osm_layers: Vec<wgpu::TextureView>,
+    osm_array: wgpu::TextureView,
+    shadow_opacity: wgpu::RenderPipeline,
     shadow_array: wgpu::TextureView,
 
     targets: Option<Targets>,
@@ -498,6 +534,12 @@ impl Renderer {
                     wgpu::TextureSampleType::Depth,
                     wgpu::TextureViewDimension::D2Array,
                 ),
+                texture_entry(
+                    10,
+                    S::FRAGMENT,
+                    wgpu::TextureSampleType::Float { filterable: false },
+                    wgpu::TextureViewDimension::D2Array,
+                ),
             ],
         });
         let mesh_bgl = mesh_bind_group_layout(device);
@@ -514,11 +556,28 @@ impl Renderer {
         let splat_mod = shader(
             device,
             "splat.wgsl",
-            include_str!("shaders/splat.wgsl"),
+            &format!(
+                "{}\n{}",
+                include_str!("shaders/lighting.wgsl"),
+                include_str!("shaders/splat.wgsl")
+            ),
             true,
         );
-        let splat_layout = pipeline_layout(device, "splat", &[&splat_bgl]);
-        let make_splat = |b: wgpu::BlendState, label: &str| {
+        // Forward shading needs the light and the opacity shadow map in the splat pass.
+        let splat_light_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("splat light bgl"),
+            entries: &[
+                uniform_entry(0, S::FRAGMENT),
+                texture_entry(
+                    1,
+                    S::FRAGMENT,
+                    wgpu::TextureSampleType::Float { filterable: false },
+                    wgpu::TextureViewDimension::D2Array,
+                ),
+            ],
+        });
+        let splat_layout = pipeline_layout(device, "splat", &[&splat_bgl, &splat_light_bgl]);
+        let make_splat = |b: wgpu::BlendState, label: &str, entry: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&splat_layout),
@@ -538,7 +597,7 @@ impl Renderer {
                 multisample: Default::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &splat_mod,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(entry),
                     compilation_options: Default::default(),
                     targets: &gbuffer_targets(Some(b)),
                 }),
@@ -547,13 +606,13 @@ impl Renderer {
             })
         };
         // Front-to-back "under" blending (Bernhard Kerbl's 3DGS tutorial, slide 25).
-        let splat = make_splat(
-            blend(wgpu::BlendFactor::OneMinusDstAlpha, wgpu::BlendFactor::One),
-            "splat",
-        );
+        let under = blend(wgpu::BlendFactor::OneMinusDstAlpha, wgpu::BlendFactor::One);
+        let splat = make_splat(under, "splat", "fs_main");
+        let splat_forward = make_splat(under, "splat forward", "fs_forward");
         let splat_overdraw = make_splat(
             blend(wgpu::BlendFactor::One, wgpu::BlendFactor::One),
             "splat overdraw",
+            "fs_main",
         );
 
         let mesh_mod = shader(device, "mesh.wgsl", include_str!("shaders/mesh.wgsl"), true);
@@ -670,11 +729,45 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        // Same geometry, but accumulating absorbed light instead of depth.
+        let shadow_opacity = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shadow opacity"),
+            layout: Some(&shadow_draw_layout),
+            vertex: wgpu::VertexState {
+                module: &shadow_draw_mod,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shadow_draw_mod,
+                entry_point: Some("fs_opacity"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: OSM_FORMAT,
+                    blend: Some(blend(wgpu::BlendFactor::One, wgpu::BlendFactor::One)),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
 
         let deferred_mod = shader(
             device,
             "deferred.wgsl",
-            include_str!("shaders/deferred.wgsl"),
+            &format!(
+                "{}\n{}",
+                include_str!("shaders/lighting.wgsl"),
+                include_str!("shaders/deferred.wgsl")
+            ),
             false,
         );
         let deferred_layout = pipeline_layout(device, "deferred", &[&deferred_bgl]);
@@ -786,6 +879,37 @@ impl Renderer {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
+        // Opacity shadow map: four distance slices of absorbed light per face.
+        let osm_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("opacity shadow cube"),
+            size: wgpu::Extent3d {
+                width: SHADOW_RESOLUTION,
+                height: SHADOW_RESOLUTION,
+                depth_or_array_layers: 6,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: OSM_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let osm_layers: Vec<wgpu::TextureView> = (0..6)
+            .map(|i| {
+                osm_tex.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("opacity shadow face"),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: i,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let osm_array = osm_tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("opacity shadow array"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
 
         let (query_set, resolve) = if ctx.timestamps {
             (
@@ -831,6 +955,9 @@ impl Renderer {
             sorter: RadixSorter::new(ctx),
             prepass,
             splat,
+            splat_forward,
+            splat_light_bgl,
+            splat_light_bg: None,
             splat_overdraw,
             mesh_gbuffer,
             mesh_depth,
@@ -848,6 +975,10 @@ impl Renderer {
             face_bgs,
             _shadow_tex: shadow_tex,
             shadow_layers,
+            _osm_tex: osm_tex,
+            osm_layers,
+            osm_array,
+            shadow_opacity,
             shadow_array,
             targets: None,
             gres: None,
@@ -926,7 +1057,7 @@ impl Renderer {
             };
             self.sres = Some(ShadowResources {
                 capacity,
-                squads: mk("shadow quads", capacity as u64 * 48),
+                squads: mk("shadow quads", capacity as u64 * 64),
                 face_slot: mk("shadow face slot", capacity as u64 * 4),
                 face_list: mk("shadow face list", capacity as u64 * 4),
             });
@@ -990,6 +1121,7 @@ impl Renderer {
                     e(7, tv(&t.mesh.albedo.view)),
                     e(8, tv(&t.mesh.mr.view)),
                     e(9, tv(&self.shadow_array)),
+                    e(10, tv(&self.osm_array)),
                 ],
             });
             self.bind_groups = Some(BindGroups {
@@ -1052,6 +1184,22 @@ impl Renderer {
             self.ensure_shadow_resources(device, gaussians.capacity);
         }
         self.ensure_bind_groups(device, gaussians);
+        if self.splat_light_bg.is_none() {
+            self.splat_light_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("splat light"),
+                layout: &self.splat_light_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.lighting_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.osm_array),
+                    },
+                ],
+            }));
+        }
 
         let count = gaussians.count;
         let converted = gaussians.format == SourceFormat::Converted;
@@ -1112,7 +1260,12 @@ impl Renderer {
             lighting: lighting as u32,
             split_enabled: split as u32,
             shadow_res: SHADOW_RESOLUTION,
-            _pad: [0; 2],
+            hair: settings.hair_shading as u32,
+            opacity_shadows: (settings.opacity_shadows && lighting) as u32,
+            forward: (settings.forward_shading && lighting) as u32,
+            transmission: settings.transmission,
+            shadow_density: settings.shadow_density,
+            _pad: 0,
         };
         ctx.queue
             .write_buffer(&self.lighting_buf, 0, bytemuck::bytes_of(&lighting_u));
@@ -1273,12 +1426,16 @@ impl Renderer {
                 multiview_mask: None,
             });
             if count > 0 {
+                let forward = settings.forward_shading && lighting;
                 pass.set_pipeline(if settings.render_mode == RenderMode::Overdraw {
                     &self.splat_overdraw
+                } else if forward {
+                    &self.splat_forward
                 } else {
                     &self.splat
                 });
                 pass.set_bind_group(0, &bg.splat, &[]);
+                pass.set_bind_group(1, self.splat_light_bg.as_ref().unwrap(), &[]);
                 pass.draw_indirect(&self.sorter.args, DRAW_ARGS_OFFSET);
             }
         }
@@ -1301,24 +1458,42 @@ impl Renderer {
                 pass.set_pipeline(&self.shadow_write_args);
                 pass.dispatch_workgroups(1, 1, 1);
             }
+            let opacity_shadows = settings.opacity_shadows;
             for face in 0..6 {
+                // The depth pipeline declares no colour target, so the pass
+                // must not offer one either.
+                let osm_attachment = [Some(wgpu::RenderPassColorAttachment {
+                    view: &self.osm_layers[face],
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })];
                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("shadow face"),
-                    color_attachments: &[],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.shadow_layers[face],
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: None,
+                    color_attachments: if opacity_shadows { &osm_attachment } else { &[] },
+                    depth_stencil_attachment: (!opacity_shadows).then(|| {
+                        wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.shadow_layers[face],
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }
                     }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
                 if count > 0 {
-                    pass.set_pipeline(&self.shadow_draw);
+                    pass.set_pipeline(if opacity_shadows {
+                        &self.shadow_opacity
+                    } else {
+                        &self.shadow_draw
+                    });
                     pass.set_bind_group(0, shadow_draw, &[]);
                     pass.set_bind_group(1, &self.face_bgs[face], &[]);
                     pass.draw_indirect(&self.shadow_args, face as u64 * 16);

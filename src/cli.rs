@@ -177,6 +177,15 @@ pub struct RenderArgs {
     pub light_pos: Option<Vec<f32>>,
     #[arg(long, default_value_t = 10.0)]
     pub light_intensity: f32,
+    /// Shade with the anisotropic hair model (for strand-like splats).
+    #[arg(long)]
+    pub hair: bool,
+    /// Graded self-shadowing from accumulated opacity, with transmission.
+    #[arg(long)]
+    pub opacity_shadows: bool,
+    /// Shade each splat in the splat pass instead of once per pixel.
+    #[arg(long)]
+    pub forward_shading: bool,
     /// Split-screen mesh (left) vs splats (right). Mesh inputs only.
     #[arg(long)]
     pub split: bool,
@@ -379,6 +388,9 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
     };
     let settings = RenderSettings {
         render_mode: args.mode.into(),
+        hair_shading: args.hair,
+        opacity_shadows: args.opacity_shadows,
+        forward_shading: args.forward_shading,
         gaussian_std: args.sampling.std,
         depth_test: args.depth_test,
         lighting: args.light,

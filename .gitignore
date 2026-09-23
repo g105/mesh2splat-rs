@@ -4,3 +4,4 @@
 assets/*.glb
 assets/*.gltf
 .DS_Store
+assets/*.hair

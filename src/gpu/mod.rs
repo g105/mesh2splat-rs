@@ -2,6 +2,7 @@
 
 pub mod ao;
 pub mod converter;
+pub mod pool;
 pub mod merge;
 pub mod renderer;
 pub mod scene;

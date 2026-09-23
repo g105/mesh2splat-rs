@@ -270,3 +270,78 @@ fn baked_occlusion_is_lower_inside_a_cloud() {
     // Every splat gets a usable bent normal.
     assert!(baked.iter().all(|g| g.pbr[3].to_bits() != 0));
 }
+
+#[test]
+fn gpu_pooling_matches_the_cpu_pooler() {
+    let ctx = match GpuContext::new_headless() {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipping: {e}"),
+    };
+    // A block whose interior is marked buried, as the occlusion bake would.
+    let n = 6i32;
+    let mut splats = Vec::new();
+    for z in -n..=n {
+        for y in -n..=n {
+            for x in -n..=n {
+                let p = glam::Vec3::new(x as f32, y as f32, z as f32) * 0.1;
+                let edge = x.abs() == n || y.abs() == n || z.abs() == n;
+                splats.push(mesh2splat::GaussianVertex {
+                    position: p.extend(1.0).to_array(),
+                    color: [0.5, 0.4, 0.3, 0.8],
+                    scale: [0.05, 0.02, 0.001, 0.0],
+                    normal: [0.0, 0.0, 1.0, 0.0],
+                    rotation: [1.0, 0.0, 0.0, 0.0],
+                    pbr: [0.0, 0.5, if edge { 0.9 } else { 0.1 }, 0.0],
+                });
+            }
+        }
+    }
+    let bounds = mesh2splat::types::BBox {
+        min: glam::Vec3::splat(-0.7),
+        max: glam::Vec3::splat(0.7),
+    };
+    let cfg = mesh2splat::merge::VolumeMergeSettings {
+        // Match the GPU's fixed grid so the two cluster the same way.
+        cell: Some(bounds.size().x * 1.1 / 256.0 * 64.0),
+        ..Default::default()
+    };
+    let (cpu, cpu_stats) = mesh2splat::merge::merge_occluded(&splats, &cfg);
+
+    let mut gb = GaussianBuffer::new_empty(&ctx);
+    gb.upload_ply(&ctx, &splats, false);
+    let mut pooler = mesh2splat::gpu::pool::GpuPooler::new(&ctx);
+    let (buffer, count, gpu_stats) = pooler.run(&ctx, &gb, &bounds, &cfg);
+    gb.buffer = buffer;
+    gb.count = count;
+    gb.capacity = count.max(1);
+    let gpu = gb.download(&ctx);
+
+    assert!(gpu_stats.gpu && !cpu_stats.gpu);
+    assert_eq!(gpu.len(), count as usize);
+    assert!(count < splats.len() as u32, "nothing pooled");
+    // The two cluster differently at the edges of cells, so compare in bulk.
+    let ratio = gpu.len() as f64 / cpu.len() as f64;
+    assert!(
+        (0.8..1.25).contains(&ratio),
+        "gpu {} vs cpu {} splats",
+        gpu.len(),
+        cpu.len()
+    );
+    let stops = |v: &[mesh2splat::GaussianVertex]| -> f64 {
+        v.iter()
+            .map(|g| {
+                let mut s = [g.scale[0] as f64, g.scale[1] as f64, g.scale[2] as f64];
+                s.sort_by(f64::total_cmp);
+                g.color[3] as f64 * std::f64::consts::PI * s[2] * s[1]
+            })
+            .sum()
+    };
+    // A cluster denser than one blob can represent saturates at alpha 1 and
+    // loses some extinction; what matters is that both paths lose the same.
+    let (raw, on_gpu, on_cpu) = (stops(&splats), stops(&gpu), stops(&cpu));
+    assert!(
+        (on_gpu - on_cpu).abs() / on_cpu < 0.15,
+        "gpu {on_gpu:.4} vs cpu {on_cpu:.4} (unpooled {raw:.4})"
+    );
+    assert!(on_gpu > raw * 0.6, "lost too much: {raw:.4} -> {on_gpu:.4}");
+}

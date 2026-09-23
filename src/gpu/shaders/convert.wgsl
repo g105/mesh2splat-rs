@@ -31,32 +31,6 @@ struct VsOut {
     @location(6) @interpolate(flat) axis: u32,
 };
 
-// Copied and translated from GLM (quat_cast). Returns (x, y, z, w).
-fn quat_cast(m: mat3x3<f32>) -> vec4<f32> {
-    let fx = m[0][0] - m[1][1] - m[2][2];
-    let fy = m[1][1] - m[0][0] - m[2][2];
-    let fz = m[2][2] - m[0][0] - m[1][1];
-    let fw = m[0][0] + m[1][1] + m[2][2];
-    var idx = 0;
-    var big = fw;
-    if (fx > big) { big = fx; idx = 1; }
-    if (fy > big) { big = fy; idx = 2; }
-    if (fz > big) { big = fz; idx = 3; }
-    let v = sqrt(big + 1.0) * 0.5;
-    let mult = 0.25 / v;
-    var q: vec4<f32>;
-    if (idx == 0) {
-        q = vec4<f32>((m[1][2] - m[2][1]) * mult, (m[2][0] - m[0][2]) * mult, (m[0][1] - m[1][0]) * mult, v);
-    } else if (idx == 1) {
-        q = vec4<f32>(v, (m[0][1] + m[1][0]) * mult, (m[2][0] + m[0][2]) * mult, (m[1][2] - m[2][1]) * mult);
-    } else if (idx == 2) {
-        q = vec4<f32>((m[0][1] + m[1][0]) * mult, v, (m[1][2] + m[2][1]) * mult, (m[2][0] - m[0][2]) * mult);
-    } else {
-        q = vec4<f32>((m[2][0] + m[0][2]) * mult, (m[1][2] + m[2][1]) * mult, v, (m[0][1] - m[1][0]) * mult);
-    }
-    return q;
-}
-
 // Planar projection onto the plane of the dominant normal axis, normalized by
 // the largest bbox extent of the two remaining axes.
 fn ortho_uv(p: vec3<f32>, an: vec3<f32>) -> vec2<f32> {

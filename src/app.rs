@@ -22,6 +22,7 @@ use crate::gpu::{
     BBoxMode, ConvertSettings, Converter, GaussianBuffer, GpuContext, GpuScene, RenderSettings,
     Renderer,
 };
+use crate::hair::{Groom, StrandSplats};
 use crate::ply::{self, LoadedPly};
 use crate::scene::{self, Scene};
 use crate::types::{BBox, PlyFormat, RenderMode, SourceFormat};
@@ -71,6 +72,10 @@ enum Loaded {
         path: PathBuf,
         ply: LoadedPly,
     },
+    Groom {
+        path: PathBuf,
+        groom: Box<Groom>,
+    },
     Failed {
         path: PathBuf,
         error: String,
@@ -80,11 +85,26 @@ enum Loaded {
 
 fn spawn_load(path: PathBuf, batch: bool, tx: flume::Sender<Loaded>, egui_ctx: egui::Context) {
     std::thread::spawn(move || {
-        let is_ply = path
+        let ext = path
             .extension()
             .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("ply"));
-        let msg = if is_ply {
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let msg = if ext == "hair" {
+            // Grooms are modelled at their own scale; the renderer assumes a
+            // unit-ish model (see `Groom::normalized`).
+            match Groom::load(&path) {
+                Ok(g) => Loaded::Groom {
+                    path,
+                    groom: Box::new(g.normalized(2.0)),
+                },
+                Err(e) => Loaded::Failed {
+                    path,
+                    error: format!("{e:#}"),
+                    batch,
+                },
+            }
+        } else if ext == "ply" {
             match ply::load_gaussian_ply(&path) {
                 Ok(ply) => Loaded::Ply { path, ply },
                 Err(e) => Loaded::Failed {
@@ -221,6 +241,10 @@ pub struct App {
     quality: f32,
     max_res: u32,
     bbox_mode: BBoxMode,
+    /// Loaded hair groom, kept so the strand settings can rebuild its splats.
+    groom: Option<Box<Groom>>,
+    groom_strands: usize,
+    groom_splats: StrandSplats,
     merge_enabled: bool,
     merge_strength: f32,
     detail_enabled: bool,
@@ -315,6 +339,9 @@ impl App {
             quality: 0.5,
             max_res: 1024,
             bbox_mode: BBoxMode::Scene,
+            groom: None,
+            groom_strands: 20000,
+            groom_splats: StrandSplats::default(),
             merge_enabled: false,
             merge_strength: MergeSettings::DEFAULT_STRENGTH,
             detail_enabled: false,
@@ -373,6 +400,21 @@ impl App {
         self.path_input = path.display().to_string();
         self.loading = Some(path.clone());
         spawn_load(path, false, self.tx.clone(), egui_ctx.clone());
+    }
+
+    /// Rebuild the strand splats after a groom setting changed.
+    fn rebuild_groom(&mut self) {
+        let Some(groom) = &self.groom else {
+            return;
+        };
+        let sub = groom.subsampled(self.groom_strands);
+        let splats = sub.splats(&self.groom_splats);
+        let mut bbox = BBox::EMPTY;
+        for g in &splats {
+            bbox.grow(Vec3::from_slice(&g.position[..3]));
+        }
+        self.scene_bbox = bbox;
+        self.gaussians.upload_ply(&self.ctx, &splats, false);
     }
 
     fn resolution(&self) -> u32 {
@@ -443,6 +485,35 @@ impl App {
                             false,
                         );
                     }
+                    self.loaded_path = Some(path);
+                }
+                Loaded::Groom { path, groom } => {
+                    self.loading = None;
+                    self.scene = None;
+                    self.settings.model_transform = Mat4::IDENTITY;
+                    self.settings.depth_test = false;
+                    let strands = groom.strands.len();
+                    let segments = groom.segment_count();
+                    self.groom_strands = self.groom_strands.min(strands);
+                    self.groom = Some(groom);
+                    self.rebuild_groom();
+                    // Strand splats are long and thin: shade them as fibres.
+                    self.settings.hair_shading = true;
+                    self.settings.opacity_shadows = true;
+                    self.camera.frame_bbox(&self.scene_bbox);
+                    self.place_light_default();
+                    if let Some(stem) = path.file_stem() {
+                        self.output_name = format!("{}.ply", stem.to_string_lossy());
+                    }
+                    self.set_status(
+                        format!(
+                            "Loaded {} strands ({} segments) from {}; enable lighting to see the hair shading",
+                            fmt_thousands(strands as u64),
+                            fmt_thousands(segments as u64),
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                        false,
+                    );
                     self.loaded_path = Some(path);
                 }
                 Loaded::Ply { path, ply } => {
@@ -647,8 +718,11 @@ impl App {
             ui.add_space(4.0);
 
             egui::CollapsingHeader::new("Input").default_open(true).show(ui, |ui| {
-                if ui.button("Select file to load (.glb / .gltf / .ply)").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().add_filter("Mesh or 3DGS", &["glb", "gltf", "ply"]).pick_file() {
+                if ui.button("Select file to load (.glb / .gltf / .ply / .hair)").clicked() {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter("Mesh, 3DGS or hair groom", &["glb", "gltf", "ply", "hair"])
+                        .pick_file()
+                    {
                         self.open(p, &egui_ctx);
                     }
                 }
@@ -806,6 +880,10 @@ impl App {
                 }
             });
 
+            if self.groom.is_some() {
+                egui::CollapsingHeader::new("Groom").default_open(true).show(ui, |ui| self.groom_ui(ui));
+            }
+
             egui::CollapsingHeader::new("Camera").default_open(false).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Controls:");
@@ -865,6 +943,54 @@ impl App {
                 CameraControls::Maya => "Camera (Alt or Cmd): +LMB tumble, +MMB or Alt+Cmd+LMB pan, +RMB / wheel / pinch dolly. F frame, Q/W/E/R tools, +/- gizmo size.",
             });
         });
+    }
+
+    /// Strand settings; each rebuilds the splats from the loaded groom.
+    fn groom_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(groom) = &self.groom else {
+            return;
+        };
+        let total = groom.strands.len();
+        let thickness = groom.thickness;
+        ui.label(format!(
+            "{} strands loaded, {} splats shown",
+            fmt_thousands(total as u64),
+            fmt_thousands(self.gaussians.count as u64)
+        ));
+        let mut changed = false;
+        // Rebuilding runs on the CPU, so only do it when a drag ends.
+        let mut slider = |ui: &mut egui::Ui, w: egui::Slider<'_>| {
+            let r = ui.add(w);
+            changed |= r.drag_stopped() || (r.changed() && !r.dragged());
+        };
+        slider(
+            ui,
+            egui::Slider::new(&mut self.groom_strands, 100..=total.max(100))
+                .logarithmic(true)
+                .text("Strands"),
+        );
+        slider(
+            ui,
+            egui::Slider::new(&mut self.groom_splats.per_segment, 1..=6).text("Splats per segment"),
+        );
+        let mut width = self.groom_splats.width.unwrap_or(thickness);
+        slider(
+            ui,
+            egui::Slider::new(&mut width, thickness * 0.1..=thickness * 4.0)
+                .logarithmic(true)
+                .text("Strand width"),
+        );
+        self.groom_splats.width = Some(width);
+        slider(
+            ui,
+            egui::Slider::new(&mut self.groom_splats.alpha, 0.05..=1.0).text("Strand opacity"),
+        );
+        if changed {
+            self.rebuild_groom();
+        }
+        if !self.settings.lighting {
+            ui.small("Enable lighting to see the anisotropic hair shading.");
+        }
     }
 
     fn batch_ui(&mut self, ui: &mut egui::Ui) {

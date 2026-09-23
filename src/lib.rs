@@ -8,6 +8,7 @@ pub mod app;
 pub mod camera;
 pub mod cli;
 pub mod gpu;
+pub mod hair;
 pub mod merge;
 pub mod ply;
 pub mod scene;

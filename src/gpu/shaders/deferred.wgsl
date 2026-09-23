@@ -154,12 +154,14 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let d = length(lt.light_pos.xyz - pos);
     let radiance = lt.light_color.rgb * lt.light_color.w / (d * d);
 
+    let t = decode_tangent(n, mr.z);
     var lo = vec3<f32>(0.0);
     if (lt.hair == 1u) {
-        lo = hair_lighting(decode_tangent(n, mr.z), n, v, l, albedo, roughness);
+        lo = hair_lighting(t, n, v, l, albedo, lt.fibre.yz, f0_from_ior(lt.fibre.x), lt.fibre.w);
     } else {
-        lo = pbr_lighting(n, v, l, albedo, metallic, roughness);
+        lo = pbr_lighting(n, t, v, l, albedo, metallic, roughness, lt.fibre.x, lt.aniso.x);
     }
+    lo += sheen_lighting(n, v, l, lt.sheen.rgb, lt.sheen.w);
     lo *= radiance * (1.0 - shadow);
     // Light that came through the splats in front lights this one from behind.
     if (through > 0.0) {

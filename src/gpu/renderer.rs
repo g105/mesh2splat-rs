@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat3, Mat4, Vec3};
+use glam::{Mat3, Mat4, Vec2, Vec3};
 
 use super::scene::{mesh_bind_group_layout, GpuScene};
 use super::sort::{RadixSorter, DRAW_ARGS_OFFSET};
@@ -65,6 +65,20 @@ pub struct RenderSettings {
     pub attenuation_color: Vec3,
     /// Optical depth over which `attenuation_color` applies.
     pub attenuation_distance: f32,
+    /// Index of refraction, which sets how strong the specular reflection is
+    /// (1.5 for most dielectrics, ~1.55 for hair).
+    pub ior: f32,
+    /// Hair highlight roughness along the strand and across it. A highlight
+    /// that is sharp lengthwise and broad crosswise is what reads as hair.
+    pub fibre_roughness: Vec2,
+    /// How far the two hair lobes tilt off the strand, towards root and tip.
+    pub fibre_shift: f32,
+    /// Sheen colour: the soft rim of a fibrous surface. Black turns it off.
+    pub sheen_color: Vec3,
+    pub sheen_roughness: f32,
+    /// Stretches the specular highlight along the tangent (0 = isotropic).
+    /// Applies to the normal PBR model, for brushed metal and hair cards.
+    pub anisotropy: f32,
     /// Use the occlusion baked into the splats (see [`super::ao::AoBaker`]).
     /// Exact in the forward path; in the deferred path it folds into the
     /// colour, which dims direct light too.
@@ -96,6 +110,13 @@ impl Default for RenderSettings {
             shadow_density: 4.0,
             attenuation_color: Vec3::new(0.85, 0.55, 0.35),
             attenuation_distance: 1.0,
+            // 1.5 gives the usual 0.04 reflectance, so meshes look as before.
+            ior: 1.5,
+            fibre_roughness: Vec2::new(0.25, 0.55),
+            fibre_shift: 0.08,
+            sheen_color: Vec3::ZERO,
+            sheen_roughness: 0.3,
+            anisotropy: 0.0,
             ambient_occlusion: true,
             forward_shading: false,
         }
@@ -195,6 +216,9 @@ struct LightingUniform {
     // `attenuation` is a vec4 and so starts on a 16-byte boundary.
     _pad: u32,
     attenuation: [f32; 4],
+    fibre: [f32; 4],
+    sheen: [f32; 4],
+    aniso: [f32; 4],
 }
 
 #[repr(C)]
@@ -1288,6 +1312,14 @@ impl Renderer {
                 .attenuation_color
                 .extend(settings.attenuation_distance)
                 .to_array(),
+            fibre: [
+                settings.ior,
+                settings.fibre_roughness.x,
+                settings.fibre_roughness.y,
+                settings.fibre_shift,
+            ],
+            sheen: settings.sheen_color.extend(settings.sheen_roughness).to_array(),
+            aniso: [settings.anisotropy, 0.0, 0.0, 0.0],
         };
         ctx.queue
             .write_buffer(&self.lighting_buf, 0, bytemuck::bytes_of(&lighting_u));

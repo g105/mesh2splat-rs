@@ -18,4 +18,11 @@ struct Frame {
     // sort_scale == 0 means sort on the raw 32-bit float depth.
     sort_min: f32,
     sort_scale: f32,
+    // Deferred shading has no spare G-buffer channel for baked occlusion, so
+    // the splat pass folds it into the colour it writes. That dims direct light
+    // as well as ambient; the forward path applies it to ambient only.
+    ao_deferred: f32,
+    _p1: f32,
+    _p2: f32,
+    _p3: f32,
 };

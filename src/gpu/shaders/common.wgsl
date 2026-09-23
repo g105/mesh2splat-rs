@@ -36,8 +36,10 @@ struct Quad {
     extent: u32,           // pack2x16float: half-axis lengths in standard deviations
     color: u32,            // pack4x8unorm rgba (a = opacity)
     normal: u32,           // pack2x16unorm of the octahedral world normal
-    metal_rough: u32,      // pack4x8unorm (metallic, roughness, 0, 0)
-    _pad: u32,
+    metal_rough: u32,      // pack4x8unorm (metallic, roughness, tangent angle, 0)
+    /// Baked shading data: octahedral bent normal in 2 x 12 bits, then 8 bits
+    /// of ambient occlusion (see `pack_ao_bent`).
+    ao_bent: u32,
 };
 
 fn oct_wrap(v: vec2<f32>) -> vec2<f32> {
@@ -51,6 +53,24 @@ fn oct_encode(n: vec3<f32>) -> vec2<f32> {
         p = oct_wrap(p);
     }
     return p * 0.5 + 0.5;
+}
+
+/// Bent normal (12 bits per octahedral component) plus occlusion (8 bits).
+fn pack_ao_bent(bent: vec3<f32>, ao: f32) -> u32 {
+    let e = oct_encode(bent);
+    let x = u32(clamp(e.x, 0.0, 1.0) * 4095.0 + 0.5);
+    let y = u32(clamp(e.y, 0.0, 1.0) * 4095.0 + 0.5);
+    return (x << 20u) | (y << 8u) | u32(clamp(ao, 0.0, 1.0) * 255.0 + 0.5);
+}
+
+fn unpack_ao(v: u32) -> f32 {
+    return f32(v & 0xffu) / 255.0;
+}
+
+fn unpack_bent(v: u32) -> vec3<f32> {
+    return oct_decode(vec2<f32>(
+        f32((v >> 20u) & 0xfffu) / 4095.0,
+        f32((v >> 8u) & 0xfffu) / 4095.0));
 }
 
 fn oct_decode(e: vec2<f32>) -> vec3<f32> {

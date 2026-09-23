@@ -17,11 +17,17 @@ use glam::{Mat3, Quat, Vec3};
 
 use crate::types::{BBox, GaussianVertex, DEFAULT_METALLIC, DEFAULT_ROUGHNESS};
 
-/// One strand: a polyline with a colour per point.
+/// One strand: a polyline with a colour, width and opacity per point.
+/// Root-to-tip thinning and see-through tips are most of what makes a groom
+/// look soft at the edges, and the file carries both.
 #[derive(Clone, Debug)]
 pub struct Strand {
     pub points: Vec<Vec3>,
     pub colors: Vec<Vec3>,
+    /// Strand width at each point.
+    pub thickness: Vec<f32>,
+    /// Opacity at each point (1 = opaque).
+    pub alpha: Vec<f32>,
 }
 
 /// A loaded groom, with the file's own default strand thickness.
@@ -35,11 +41,11 @@ pub struct Groom {
 /// How to turn strands into splats.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StrandSplats {
-    /// Splat width; `None` uses the groom's own thickness.
+    /// Splat width; `None` uses each point's own thickness from the file.
     pub width: Option<f32>,
     /// Splats per strand segment. More gives smoother curls.
     pub per_segment: usize,
-    /// Opacity of each splat. Below 1 lets strands blend.
+    /// Multiplies each point's own opacity from the file.
     pub alpha: f32,
 }
 
@@ -75,7 +81,8 @@ impl Groom {
         let point_count = u32_at(&data, 8) as usize;
         let flags = u32_at(&data, 12);
         let default_segments = u32_at(&data, 16) as usize;
-        let thickness = f32_at(&data, 20);
+        let default_thickness = f32_at(&data, 20);
+        let default_alpha = 1.0 - f32_at(&data, 24);
         let default_color = Vec3::new(f32_at(&data, 28), f32_at(&data, 32), f32_at(&data, 36));
         let (has_segments, has_points) = (flags & 1 != 0, flags & 2 != 0);
         let (has_thickness, has_transparency) = (flags & 4 != 0, flags & 8 != 0);
@@ -99,12 +106,16 @@ impl Groom {
         };
         let points_at = off;
         off += point_count * 12;
-        if has_thickness {
+        let thickness_at = has_thickness.then(|| {
+            let at = off;
             off += point_count * 4;
-        }
-        if has_transparency {
+            at
+        });
+        let transparency_at = has_transparency.then(|| {
+            let at = off;
             off += point_count * 4;
-        }
+            at
+        });
         let colors_at = has_color.then_some(off);
         let need = points_at + point_count * 12;
         if data.len() < need {
@@ -117,6 +128,8 @@ impl Groom {
             let n = seg + 1;
             let mut points = Vec::with_capacity(n);
             let mut colors = Vec::with_capacity(n);
+            let mut thickness = Vec::with_capacity(n);
+            let mut alpha = Vec::with_capacity(n);
             for k in 0..n {
                 let o = points_at + (p + k) * 12;
                 points.push(Vec3::new(
@@ -131,11 +144,27 @@ impl Groom {
                     }
                     None => default_color,
                 });
+                thickness.push(match thickness_at {
+                    Some(t) => f32_at(&data, t + (p + k) * 4),
+                    None => default_thickness,
+                });
+                alpha.push(match transparency_at {
+                    Some(t) => 1.0 - f32_at(&data, t + (p + k) * 4),
+                    None => default_alpha,
+                });
             }
             p += n;
-            strands.push(Strand { points, colors });
+            strands.push(Strand {
+                points,
+                colors,
+                thickness,
+                alpha,
+            });
         }
-        Ok(Self { strands, thickness })
+        Ok(Self {
+            strands,
+            thickness: default_thickness,
+        })
     }
 
     pub fn bbox(&self) -> BBox {
@@ -180,6 +209,8 @@ impl Groom {
                 .map(|s| Strand {
                     points: s.points.iter().map(|p| (*p - offset) * fit).collect(),
                     colors: s.colors.clone(),
+                    thickness: s.thickness.iter().map(|t| t * fit).collect(),
+                    alpha: s.alpha.clone(),
                 })
                 .collect(),
             thickness: self.thickness * fit,
@@ -190,7 +221,6 @@ impl Groom {
     /// shaped like it. Returned splats use [`crate::SourceFormat::Ply`]
     /// semantics: the scales are final world standard deviations.
     pub fn splats(&self, cfg: &StrandSplats) -> Vec<GaussianVertex> {
-        let width = cfg.width.unwrap_or(self.thickness);
         let center = self.bbox().center();
         let k = cfg.per_segment.max(1);
         let mut out = Vec::with_capacity(self.segment_count() * k);
@@ -216,10 +246,24 @@ impl Groom {
                         normal = -normal;
                     }
                     let q = Quat::from_mat3(&Mat3::from_cols(tangent, side, normal)).normalize();
-                    let color = c0.lerp(c1, (t0 + t1) * 0.5).clamp(Vec3::ZERO, Vec3::ONE);
+                    let mid_t = (t0 + t1) * 0.5;
+                    let color = c0.lerp(c1, mid_t).clamp(Vec3::ZERO, Vec3::ONE);
+                    // Width and opacity taper along the strand unless overridden.
+                    let lerp = |a: f32, b: f32| a + (b - a) * mid_t;
+                    let width = cfg.width.unwrap_or_else(|| {
+                        lerp(
+                            s.thickness.get(i).copied().unwrap_or(self.thickness),
+                            s.thickness.get(i + 1).copied().unwrap_or(self.thickness),
+                        )
+                    });
+                    let alpha = cfg.alpha
+                        * lerp(
+                            s.alpha.get(i).copied().unwrap_or(1.0),
+                            s.alpha.get(i + 1).copied().unwrap_or(1.0),
+                        );
                     out.push(GaussianVertex {
                         position: mid.extend(1.0).to_array(),
-                        color: color.extend(cfg.alpha).to_array(),
+                        color: color.extend(alpha.clamp(0.0, 1.0)).to_array(),
                         // Half-length: neighbouring splats overlap.
                         scale: [
                             (b - a).length() * 0.5,
@@ -251,6 +295,11 @@ mod tests {
                         .map(|k| Vec3::new(i as f32, k as f32 * 0.5, 0.0))
                         .collect(),
                     colors: vec![Vec3::splat(0.5); segments + 1],
+                    // Tapers from root to tip, as a real groom does.
+                    thickness: (0..=segments)
+                        .map(|k| 0.1 * (1.0 - 0.5 * k as f32 / segments as f32))
+                        .collect(),
+                    alpha: vec![1.0; segments + 1],
                 })
                 .collect(),
         }
@@ -277,6 +326,20 @@ mod tests {
             // Right-handed, so the shaders' row/column convention holds.
             assert!(axes.determinant() > 0.99, "{}", axes.determinant());
         }
+    }
+
+    #[test]
+    fn splat_width_tapers_with_the_strand() {
+        let g = straight_groom(1, 8);
+        let splats = g.splats(&StrandSplats::default());
+        let width = |s: &GaussianVertex| s.scale[1];
+        // Width comes from the file's per-point thickness unless overridden.
+        assert!(width(splats.first().unwrap()) > width(splats.last().unwrap()));
+        let fixed = g.splats(&StrandSplats {
+            width: Some(0.05),
+            ..Default::default()
+        });
+        assert!(fixed.iter().all(|s| (width(s) - 0.025).abs() < 1e-6));
     }
 
     #[test]

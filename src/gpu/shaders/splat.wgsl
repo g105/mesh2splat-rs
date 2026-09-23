@@ -18,7 +18,7 @@ struct VsOut {
     // the gaussian is exp(-0.5 * |local|^2) with no per-fragment conic math.
     @location(0) local: vec2<f32>,
     @location(1) @interpolate(flat) ws_pos: vec3<f32>,
-    @location(2) @interpolate(flat) packed: vec3<u32>, // color, normal, metal_rough
+    @location(2) @interpolate(flat) packed: vec4<u32>, // color, normal, metal_rough, ao/bent
 };
 
 @vertex
@@ -32,7 +32,7 @@ fn vs_main(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -
     out.pos = vec4<f32>(q.mean_ndc + c.x * major + c.y * minor, 0.0, 1.0);
     out.local = c * unpack2x16float(q.extent);
     out.ws_pos = q.ws_pos;
-    out.packed = vec3<u32>(q.color, q.normal, q.metal_rough);
+    out.packed = vec4<u32>(q.color, q.normal, q.metal_rough, q.ao_bent);
     return out;
 }
 
@@ -46,10 +46,10 @@ fn face_index(dir: vec3<f32>) -> u32 {
     return select(5u, 4u, dir.z > 0.0);
 }
 
-/// How much light reaches `pos`, from the opacity shadow map.
-fn light_through(pos: vec3<f32>) -> f32 {
+/// Opacity between `pos` and the light, from the opacity shadow map.
+fn optical_depth(pos: vec3<f32>) -> f32 {
     if (lt.opacity_shadows != 1u) {
-        return 1.0;
+        return 0.0;
     }
     let to_frag = pos - lt.light_pos.xyz;
     let dist = length(to_frag);
@@ -60,7 +60,7 @@ fn light_through(pos: vec3<f32>) -> f32 {
     let res = i32(lt.shadow_res);
     let px = vec2<i32>(vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - 0.5 * ndc.y) * f32(res));
     let slices = textureLoad(opacity_map, clamp(px, vec2<i32>(0), vec2<i32>(res - 1)), i32(face), 0);
-    return slices_to_transmittance(slices, dist, lt.far_plane, lt.shadow_density);
+    return slices_to_optical_depth(slices, dist, lt.far_plane);
 }
 
 struct GBufferOut {
@@ -84,7 +84,8 @@ fn fs_main(in: VsOut) -> GBufferOut {
     if (frame.render_mode == 4u) {
         out.albedo = vec4<f32>(0.01, 0.005, 0.0, 0.01);
     } else {
-        out.albedo = vec4<f32>(color.rgb * opacity, opacity) * g;
+        let ao = mix(1.0, unpack_ao(in.packed.w), frame.ao_deferred);
+        out.albedo = vec4<f32>(color.rgb * ao * opacity, opacity) * g;
     }
     out.position = vec4<f32>(in.ws_pos, 1.0) * g;
     // Premultiply by opacity so rgb / a in the deferred pass is an opacity-weighted
@@ -116,7 +117,8 @@ fn fs_forward(in: VsOut) -> GBufferOut {
     let radiance = lt.light_color.rgb * lt.light_color.w / (d * d);
     let albedo = pow(color.rgb, vec3<f32>(2.2));
 
-    let through = light_through(pos);
+    let optical = optical_depth(pos);
+    let through = exp(-lt.shadow_density * optical);
     var lo = vec3<f32>(0.0);
     if (lt.hair == 1u) {
         lo = hair_lighting(t, n, v, l, albedo, mr.y);
@@ -125,9 +127,15 @@ fn fs_forward(in: VsOut) -> GBufferOut {
     }
     lo *= radiance * through;
     if (lt.transmission > 0.0) {
-        lo += transmission_term(v, l, albedo, through * lt.transmission) * radiance;
+        let tint = attenuation_tint(lt.attenuation.rgb, lt.attenuation.w, optical);
+        lo += transmission_term(v, l, albedo, through * lt.transmission, tint) * radiance;
     }
-    let shaded = tonemap(vec3<f32>(0.3) * albedo + lo);
+    // Ambient only reaches a splat as far as the bake says it is open, and
+    // from the direction that was open.
+    let ao = unpack_ao(in.packed.w);
+    let bent = unpack_bent(in.packed.w);
+    let ambient = 0.3 * ao * mix(0.6, 1.0, clamp(dot(bent, l) * 0.5 + 0.5, 0.0, 1.0));
+    let shaded = tonemap(ambient * albedo + lo);
 
     var out: GBufferOut;
     out.albedo = vec4<f32>(shaded * opacity, opacity) * g;

@@ -25,6 +25,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use glam::{Vec3, Vec4};
 use mesh2splat::camera::Camera;
+use mesh2splat::gpu::ao::{self, AoSettings};
 use mesh2splat::gpu::*;
 use mesh2splat::hair::{Groom, Strand, StrandSplats};
 use mesh2splat::scene::{Material, Mesh, Scene, TextureData, Vertex};
@@ -153,6 +154,7 @@ struct Args {
     width_cells: f32,
     std: f32,
     bench: usize,
+    no_ao: bool,
     out: PathBuf,
 }
 
@@ -172,6 +174,7 @@ fn parse_args() -> Result<Args> {
         width_cells: 1.5,
         std: 0.65,
         bench: 0,
+        no_ao: false,
         out: "target/groom".into(),
     };
     let mut it = std::env::args().skip(1);
@@ -191,6 +194,7 @@ fn parse_args() -> Result<Args> {
             "--width-cells" => a.width_cells = val()?.parse()?,
             "--std" => a.std = val()?.parse()?,
             "--bench" => a.bench = val()?.parse()?,
+            "--no-ao" => a.no_ao = true,
             "--out" => a.out = val()?.into(),
             _ => a.file = arg.into(),
         }
@@ -279,7 +283,16 @@ fn main() -> Result<()> {
             args.per_segment
         );
     }
+    if !args.no_ao {
+        // Bake occlusion and a bent normal into the splats' spare channels.
+        let t = std::time::Instant::now();
+        ao::AoBaker::new(&ctx).bake(&ctx, &gb, &bbox, &AoSettings::default());
+        ctx.wait_idle();
+        println!("baked occlusion in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    }
     let splats = gb.download(&ctx);
+    let mean_ao = splats.iter().map(|g| g.pbr[2] as f64).sum::<f64>() / splats.len().max(1) as f64;
+    println!("mean occlusion {:.2} (1 = fully open)", mean_ao);
     println!(
         "median in-plane anisotropy: {:.2}x (1 = round, higher = strand shaped)",
         median_anisotropy(&splats)

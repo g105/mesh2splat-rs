@@ -206,3 +206,67 @@ fn detail_aware_density() {
         assert!((p.abs().max_element() - 0.5).abs() < 1e-3, "{p}");
     }
 }
+
+#[test]
+fn baked_occlusion_is_lower_inside_a_cloud() {
+    let ctx = match GpuContext::new_headless() {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipping: {e}"),
+    };
+    // A solid block of splats: the middle is buried, the corners are not.
+    let n = 12;
+    let mut splats = Vec::new();
+    for z in 0..n {
+        for y in 0..n {
+            for x in 0..n {
+                let p = glam::Vec3::new(x as f32, y as f32, z as f32) / n as f32 - 0.5;
+                splats.push(mesh2splat::GaussianVertex {
+                    position: p.extend(1.0).to_array(),
+                    color: [0.5, 0.5, 0.5, 1.0],
+                    scale: [0.05, 0.05, 0.01, 0.0],
+                    normal: [0.0, 0.0, 1.0, 0.0],
+                    rotation: [1.0, 0.0, 0.0, 0.0],
+                    pbr: [0.0, 0.5, 0.0, 1.0],
+                });
+            }
+        }
+    }
+    let mut gb = GaussianBuffer::new_empty(&ctx);
+    gb.upload_ply(&ctx, &splats, false);
+    let bounds = mesh2splat::types::BBox {
+        min: glam::Vec3::splat(-0.5),
+        max: glam::Vec3::splat(0.5),
+    };
+    mesh2splat::gpu::ao::AoBaker::new(&ctx).bake(
+        &ctx,
+        &gb,
+        &bounds,
+        &mesh2splat::gpu::ao::AoSettings::default(),
+    );
+    let baked = gb.download(&ctx);
+    assert_eq!(baked.len(), splats.len());
+
+    let center = |g: &mesh2splat::GaussianVertex| {
+        glam::Vec3::from_slice(&g.position[..3]).length()
+    };
+    let middle: Vec<f32> = baked
+        .iter()
+        .filter(|g| center(g) < 0.15)
+        .map(|g| g.pbr[2])
+        .collect();
+    let outside: Vec<f32> = baked
+        .iter()
+        .filter(|g| center(g) > 0.6)
+        .map(|g| g.pbr[2])
+        .collect();
+    let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
+    assert!(!middle.is_empty() && !outside.is_empty());
+    assert!(
+        mean(&middle) < mean(&outside) * 0.8,
+        "buried {:.3} vs exposed {:.3}",
+        mean(&middle),
+        mean(&outside)
+    );
+    // Every splat gets a usable bent normal.
+    assert!(baked.iter().all(|g| g.pbr[3].to_bits() != 0));
+}

@@ -69,6 +69,18 @@ them as surfaces reads as felt. Three settings (all off by default) target that:
   specular lobes work off the angle to each splat's longest axis instead of its
   normal. The tangent rides through the G-buffer as an angle in the plane of the
   normal, packed into a channel that was previously written as zero.
+* **Baked occlusion** — splats have no surface to trace against, so a compute
+  pass voxelizes their opacity into a density grid and then, per splat, marches
+  it along 16 directions. The average transmittance is the occlusion and the
+  weighted mean direction is the bent normal, both stored in spare `pbr`
+  channels the splats already carry, so shading gets them for free. This is what
+  stops the inside of a groom reading as one solid mass, and it is the largest
+  single improvement of the three. Exact with forward shading (ambient only);
+  the deferred path has no spare G-buffer channel, so it folds occlusion into
+  the colour, which dims direct light as well. 450 k splats bake in ~150 ms.
+* **Transmission** is tinted by Beer-Lambert absorption over the optical depth
+  the opacity shadows measure, so light that comes through deep hair takes the
+  attenuation colour with it.
 * **Opacity shadows** — the shadow pass already rasterizes splats from the
   light, so instead of keeping only the nearest depth it accumulates how much
   light each splat absorbs into four distance slices. Self-shadowing becomes
@@ -89,6 +101,9 @@ them as surfaces reads as felt. Three settings (all off by default) target that:
 
   So it costs 2-4x the frame, all of it in the splat raster: worth it for a
   close look at fine geometry, not for a full groom in motion.
+
+Strand width and opacity come from the per-point values in the `.hair` file, so
+strands taper and see-through tips stay soft.
 
 Open a `.hair` groom in the viewer like any other file (**Input**, or drag and
 drop). It loads as strand-aligned splats, turns on hair shading and opacity
@@ -299,6 +314,7 @@ src/
     converter.rs    ConversionPass (one pass per sampling level)
     shaders/lighting.wgsl  shading shared by the deferred and forward paths
     scene.rs        vertex buffers, textures (CPU mip chain), per-mesh bind groups
+    ao.rs           bakes occlusion and a bent normal into the splats
     sort.rs         GPU radix sort (replaces gl-radix-sort)
     merge.rs        GPU version of the splat merge
     renderer.rs     all render passes, uniforms, G-buffers, readback

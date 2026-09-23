@@ -18,6 +18,7 @@ use crate::camera::{Camera, CameraKeys};
 use crate::gpu::converter::{resolution_from_quality, ConversionStats, DetailSettings};
 use crate::merge::MergeSettings;
 use crate::gpu::renderer::OUTPUT_FORMAT;
+use crate::gpu::ao::{AoBaker, AoSettings};
 use crate::gpu::{
     BBoxMode, ConvertSettings, Converter, GaussianBuffer, GpuContext, GpuScene, RenderSettings,
     Renderer,
@@ -241,6 +242,11 @@ pub struct App {
     quality: f32,
     max_res: u32,
     bbox_mode: BBoxMode,
+    /// Bakes occlusion into the splats; created on first use.
+    ao_baker: Option<AoBaker>,
+    ao_settings: AoSettings,
+    /// Splats the occlusion was baked for, so the UI can say it is stale.
+    ao_generation: Option<u64>,
     /// Loaded hair groom, kept so the strand settings can rebuild its splats.
     groom: Option<Box<Groom>>,
     groom_strands: usize,
@@ -339,6 +345,9 @@ impl App {
             quality: 0.5,
             max_res: 1024,
             bbox_mode: BBoxMode::Scene,
+            ao_baker: None,
+            ao_settings: AoSettings::default(),
+            ao_generation: None,
             groom: None,
             groom_strands: 20000,
             groom_splats: StrandSplats::default(),
@@ -859,6 +868,20 @@ impl App {
                 if self.settings.lighting {
                     ui.checkbox(&mut self.settings.hair_shading, "Anisotropic (hair) shading")
                         .on_hover_text("Kajiya-Kay: shade along each splat's longest axis instead of its normal. For hair, fur and other fibres, where the splats are long and thin.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Bake occlusion").on_hover_text("Walk the splats once and record, per splat, how buried it is and which way is open. Stored in spare channels, so it costs nothing to render.").clicked() {
+                            self.bake_occlusion();
+                        }
+                        let stale = self.ao_generation != Some(self.gaussians.generation);
+                        ui.label(match (self.ao_generation.is_some(), stale) {
+                            (false, _) => "not baked".to_string(),
+                            (true, true) => "stale (splats changed)".to_string(),
+                            (true, false) => "baked".to_string(),
+                        });
+                    });
+                    ui.checkbox(&mut self.settings.ambient_occlusion, "Use baked occlusion")
+                        .on_hover_text("Ambient light reaches a splat only as far as the bake says it is open. Exact with forward shading; the deferred path folds it into the colour, which dims direct light too.");
+                    ui.add(egui::Slider::new(&mut self.ao_settings.density, 0.1..=4.0).text("Occlusion density"));
                     ui.checkbox(&mut self.settings.opacity_shadows, "Opacity shadows")
                         .on_hover_text("Shadow from how much opacity is between here and the light, instead of a binary depth test: graded self-shadowing, and light can come through thin parts.");
                     if self.settings.opacity_shadows {
@@ -943,6 +966,29 @@ impl App {
                 CameraControls::Maya => "Camera (Alt or Cmd): +LMB tumble, +MMB or Alt+Cmd+LMB pan, +RMB / wheel / pinch dolly. F frame, Q/W/E/R tools, +/- gizmo size.",
             });
         });
+    }
+
+    /// Bake occlusion and a bent normal into the splats' spare channels.
+    fn bake_occlusion(&mut self) {
+        if self.gaussians.count == 0 {
+            return;
+        }
+        let bounds = self.model_bbox();
+        let start = Instant::now();
+        let baker = self
+            .ao_baker
+            .get_or_insert_with(|| AoBaker::new(&self.ctx));
+        baker.bake(&self.ctx, &self.gaussians, &bounds, &self.ao_settings);
+        self.ctx.wait_idle();
+        self.ao_generation = Some(self.gaussians.generation);
+        self.set_status(
+            format!(
+                "Baked occlusion for {} splats in {:.0} ms",
+                fmt_thousands(self.gaussians.count as u64),
+                start.elapsed().as_secs_f64() * 1e3
+            ),
+            false,
+        );
     }
 
     /// Strand settings; each rebuilds the splats from the loaded groom.

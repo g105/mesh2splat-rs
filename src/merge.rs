@@ -751,13 +751,13 @@ mod volume_tests {
     }
 
     #[test]
-    fn threshold_controls_how_much_is_pooled() {
+    fn relative_openness_controls_how_much_is_pooled() {
         let splats = block(4);
-        let count = |occlusion| {
+        let count = |relative_openness| {
             merge_occluded(
                 &splats,
                 &VolumeMergeSettings {
-                    occlusion,
+                    relative_openness,
                     ..Default::default()
                 },
             )
@@ -767,6 +767,35 @@ mod volume_tests {
         assert_eq!(count(0.0), splats.len());
         assert!(count(0.5) < count(0.05));
         assert!(count(1.0) <= count(0.5));
+    }
+
+    /// The point of measuring relative to the groom: the same setting has to
+    /// pool the same splats in two grooms whose occlusion sits at completely
+    /// different levels. An absolute threshold pools all of the dense one.
+    #[test]
+    fn the_setting_means_the_same_thing_at_any_density() {
+        let pooled = |scale: f32| {
+            let mut splats = block(4);
+            for g in &mut splats {
+                // A denser groom buries everything, silhouette included.
+                g.pbr[2] = (g.pbr[2] * scale).max(1e-4);
+            }
+            let (out, _) = merge_occluded(&splats, &VolumeMergeSettings::default());
+            splats.len() - out.len()
+        };
+        let (open, dense) = (pooled(1.0), pooled(0.1));
+        assert!(open > 0, "nothing pooled on the open groom");
+        assert_eq!(open, dense, "a denser groom pooled a different amount");
+    }
+
+    #[test]
+    fn the_quantile_lands_on_the_asked_for_share() {
+        let values: Vec<f32> = (0..1000).map(|i| i as f32 / 1000.0).collect();
+        for f in [0.1f32, 0.25, 0.5, 0.9] {
+            let t = occlusion_quantile(values.iter().copied(), f);
+            let below = values.iter().filter(|v| **v <= t).count() as f32 / values.len() as f32;
+            assert!((below - f).abs() < 0.02, "fraction {f} selected {below}");
+        }
     }
 }
 
@@ -821,25 +850,99 @@ mod axis_tests {
 /// Which splats count as interior, and how coarsely they are pooled.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VolumeMergeSettings {
-    /// Splats whose baked occlusion is at or below this are interior.
-    /// 0 merges nothing; 1 merges everything.
-    pub occlusion: f32,
+    /// A splat is interior when it is less than this fraction as open as the
+    /// groom's most open splats.
+    ///
+    /// Relative rather than absolute because the occlusion a splat reads
+    /// depends on how dense the groom around it is. A 5k-strand groom leaves
+    /// its outermost splats at ~0.4, while a 50k-strand one buries even its own
+    /// silhouette below 0.3 — so a fixed threshold of 0.3 pools the deep
+    /// interior of the first and the whole of the second, silhouette included.
+    /// Measuring against the groom's own most open splats keeps the setting
+    /// meaning the same thing at any density, and always spares the shell that
+    /// gives the groom its look.
+    pub relative_openness: f32,
     /// Side of the pooling cell, in world units. `None` derives one from the
     /// splats' own size.
     pub cell: Option<f32>,
     /// Leave clusters smaller than this alone: merging two splats saves little
     /// and costs accuracy.
     pub min_cluster: usize,
+    /// Direction bins per octahedral axis. Splats only pool with others
+    /// pointing the same way, which keeps a cluster of strands long and thin
+    /// instead of averaging it into a round blob. 1 ignores direction.
+    /// Clamped to [`MAX_DIRECTION_BINS`], which is as fine as the GPU pooler's
+    /// sort key has room for. Both paths clamp, so they stay in agreement.
+    pub direction_bins: u32,
+    /// How many cells long a cluster may run along the strand. Pooling along a
+    /// strand is nearly free; pooling across one merges neighbouring strands
+    /// into a ribbon and the groom loses its striping.
+    pub along_cells: u32,
 }
 
 impl Default for VolumeMergeSettings {
     fn default() -> Self {
         Self {
-            occlusion: 0.3,
+            relative_openness: 0.4,
             cell: None,
             min_cluster: 4,
+            direction_bins: 4,
+            along_cells: 4,
         }
     }
+}
+
+/// Octahedral mapping of a unit vector to [0, 1]^2, mirroring `oct_encode` in
+/// common.wgsl so the CPU and GPU poolers bin directions the same way.
+fn oct_encode(n: DVec3) -> (f64, f64) {
+    let sum = n.x.abs() + n.y.abs() + n.z.abs();
+    let (mut x, mut y) = (n.x / sum.max(1e-20), n.y / sum.max(1e-20));
+    if n.z < 0.0 {
+        let (ax, ay) = (x.abs(), y.abs());
+        let (sx, sy) = (x.signum(), y.signum());
+        x = (1.0 - ay) * sx;
+        y = (1.0 - ax) * sy;
+    }
+    (x * 0.5 + 0.5, y * 0.5 + 0.5)
+}
+
+/// Which bin a splat's long axis falls in. Splats only pool with others
+/// pointing the same way, so a cluster of strands stays long and thin.
+fn direction_bin(g: &GaussianVertex, bins: u32) -> (i64, DVec3) {
+    let longest = (0..3)
+        .max_by(|&a, &b| g.scale[a].total_cmp(&g.scale[b]))
+        .unwrap();
+    let mut axis = splat_axes(g.rotation).col(longest);
+    // Direction is unsigned: a strand pointing back is the same strand.
+    if axis.z < 0.0 {
+        axis = -axis;
+    }
+    if bins <= 1 {
+        return (0, axis);
+    }
+    let (u, v) = oct_encode(axis);
+    let bin = |t: f64| ((t * bins as f64) as i64).clamp(0, bins as i64 - 1);
+    let (bx, by) = (bin(u), bin(v));
+    // Every splat in a bin shares the bin's own direction, so they agree on
+    // what "along the strand" means.
+    let e = (
+        (bx as f64 + 0.5) / bins as f64,
+        (by as f64 + 0.5) / bins as f64,
+    );
+    (by * bins as i64 + bx, oct_decode(e))
+}
+
+/// Inverse of [`oct_encode`].
+fn oct_decode(e: (f64, f64)) -> DVec3 {
+    let f = DVec3::new(e.0 * 2.0 - 1.0, e.1 * 2.0 - 1.0, 0.0);
+    let mut n = DVec3::new(f.x, f.y, 1.0 - f.x.abs() - f.y.abs());
+    if n.z < 0.0 {
+        let (ax, ay) = (n.x.abs(), n.y.abs());
+        let (sx, sy) = (n.x.signum(), n.y.signum());
+        n.x = (1.0 - ay) * sx;
+        n.y = (1.0 - ax) * sy;
+    }
+    n.normalize_or(DVec3::Z)
 }
 
 /// The two in-plane standard deviations of a splat, largest first.
@@ -871,6 +974,63 @@ struct Cluster {
     members: Vec<u32>,
 }
 
+/// Bins per octahedral axis the direction key has room for: the GPU pooler
+/// packs the bin into the 4 bits above three 9-bit cell coordinates, so 4 bins
+/// per axis (16 in total) is the most that fits. Finer than the pooling cell
+/// warrants in any case.
+pub const MAX_DIRECTION_BINS: u32 = 4;
+
+/// Where "as open as this groom gets" is read off the distribution. Not the
+/// maximum, which a handful of stray splats would set.
+pub const OPEN_QUANTILE: f32 = 0.95;
+
+/// Bins the occlusion histogram is built with, on the CPU and the GPU alike.
+pub const OCCLUSION_BINS: usize = 256;
+
+/// The occlusion below which `fraction` of the splats fall. Used instead of an
+/// absolute threshold so the control means the same thing however dense the
+/// groom is; see [`VolumeMergeSettings::relative_openness`].
+pub fn occlusion_quantile(values: impl Iterator<Item = f32>, fraction: f32) -> f32 {
+    let mut hist = vec![0u32; OCCLUSION_BINS];
+    let mut total = 0u64;
+    for v in values {
+        hist[occlusion_bin(v)] += 1;
+        total += 1;
+    }
+    quantile_from_histogram(&hist, total, fraction)
+}
+
+/// Which histogram bin an occlusion value falls in.
+pub fn occlusion_bin(ao: f32) -> usize {
+    let b = if ao.is_finite() {
+        ao.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    ((b * OCCLUSION_BINS as f32) as usize).min(OCCLUSION_BINS - 1)
+}
+
+/// The bin edge below which `fraction` of the counts fall. Binning rather than
+/// sorting keeps this O(n) and, more usefully, lets the GPU pooler build the
+/// same histogram with atomics and land on exactly the same threshold.
+pub fn quantile_from_histogram(hist: &[u32], total: u64, fraction: f32) -> f32 {
+    if total == 0 || fraction <= 0.0 {
+        return 0.0;
+    }
+    if fraction >= 1.0 {
+        return f32::INFINITY;
+    }
+    let target = total as f64 * fraction as f64;
+    let mut cum = 0u64;
+    for (i, n) in hist.iter().enumerate() {
+        cum += *n as u64;
+        if cum as f64 >= target {
+            return (i + 1) as f32 / OCCLUSION_BINS as f32;
+        }
+    }
+    f32::INFINITY
+}
+
 /// Pool heavily occluded splats into coarse ones that fill the same volume and
 /// stop the same amount of light. Needs [`crate::gpu::ao::AoBaker`] to have run;
 /// without it every splat reads as fully occluded and nothing is merged.
@@ -889,22 +1049,25 @@ pub fn merge_occluded(
         return (splats.to_vec(), stats);
     }
 
+    // Measure "buried" against how open this groom's own most open splats are,
+    // so the shell is spared however dense the groom is.
+    let threshold =
+        cfg.relative_openness * occlusion_quantile(splats.iter().map(|g| g.pbr[2]), OPEN_QUANTILE);
+
     // A cell a few splats wide: big enough to pool, small enough to keep the
     // volume's shape.
     let cell = cfg.cell.unwrap_or_else(|| {
-        let mean: f64 = splats
-            .iter()
-            .map(|g| splat_face(g.scale).0)
-            .sum::<f64>()
-            / splats.len().max(1) as f64;
+        let mean: f64 =
+            splats.iter().map(|g| splat_face(g.scale).0).sum::<f64>() / splats.len().max(1) as f64;
         (mean * 6.0) as f32
     }) as f64;
 
     // Far fewer cells than splats, so the default hasher is not worth replacing.
-    let mut clusters: HashMap<[i64; 3], Cluster> = HashMap::new();
+    let mut clusters: HashMap<[i64; 4], Cluster> = HashMap::new();
     let mut interior = vec![false; splats.len()];
     for (i, g) in splats.iter().enumerate() {
-        if g.pbr[2] > cfg.occlusion {
+        // `pbr.z` of 0 means never baked: unknown, not buried.
+        if g.pbr[2] <= 0.0 || g.pbr[2] > threshold {
             continue;
         }
         interior[i] = true;
@@ -913,10 +1076,21 @@ pub fn merge_occluded(
             g.position[1] as f64,
             g.position[2] as f64,
         );
+        let (bin, dir) = direction_bin(g, cfg.direction_bins.clamp(1, MAX_DIRECTION_BINS));
+        // One frame per bin: pool along the strand far more readily than across.
+        let up = if dir.z.abs() > 0.9 {
+            DVec3::X
+        } else {
+            DVec3::Z
+        };
+        let u_axis = up.cross(dir).normalize_or(DVec3::X);
+        let v_axis = dir.cross(u_axis);
+        let along = cell * cfg.along_cells.max(1) as f64;
         let key = [
-            (p.x / cell).floor() as i64,
-            (p.y / cell).floor() as i64,
-            (p.z / cell).floor() as i64,
+            (p.dot(dir) / along).floor() as i64,
+            (p.dot(u_axis) / cell).floor() as i64,
+            (p.dot(v_axis) / cell).floor() as i64,
+            bin,
         ];
         let w = extinction(g).max(1e-12);
         let c = clusters.entry(key).or_default();
@@ -932,11 +1106,7 @@ pub fn merge_occluded(
         for k in 0..3 {
             c.sum_color[k] += g.color[k] as f64 * w;
         }
-        c.sum_normal += DVec3::new(
-            g.normal[0] as f64,
-            g.normal[1] as f64,
-            g.normal[2] as f64,
-        ) * w;
+        c.sum_normal += DVec3::new(g.normal[0] as f64, g.normal[1] as f64, g.normal[2] as f64) * w;
         c.sum_pbr[0] += g.pbr[0] as f64 * w;
         c.sum_pbr[1] += g.pbr[1] as f64 * w;
         c.sum_ao += g.pbr[2] as f64 * w;
@@ -953,8 +1123,8 @@ pub fn merge_occluded(
         let mean = c.sum_p * inv;
         // The cluster's own spread plus each member's shape: a blob that fills
         // the volume the strands occupied.
-        let spread = unsym(&c.sum_pp) * inv
-            - DMat3::from_cols(mean * mean.x, mean * mean.y, mean * mean.z);
+        let spread =
+            unsym(&c.sum_pp) * inv - DMat3::from_cols(mean * mean.x, mean * mean.y, mean * mean.z);
         let cov = unsym(&c.sum_cov) * inv + spread;
         let (rotation, scale) = splat_from_covariance(cov);
         // Keep the volume as opaque as the strands were: the coarse splat has a
@@ -989,7 +1159,7 @@ pub fn merge_occluded(
     let mut out: Vec<GaussianVertex> = splats
         .iter()
         .enumerate()
-        .filter(|(i, g)| g.pbr[2] > cfg.occlusion || !was_merged(&interior, *i))
+        .filter(|(i, g)| g.pbr[2] <= 0.0 || g.pbr[2] > threshold || !was_merged(&interior, *i))
         .map(|(_, g)| *g)
         .collect();
     let clustered = merged.len();

@@ -149,28 +149,47 @@ the volume contributes bulk opacity and colour but no silhouette and no
 highlight, and the occlusion bake already says which those are. `merge_occluded`
 pools them by cell into coarse splats that fill the same volume and stop the
 same amount of light — the merged splat's opacity is set so that opacity times
-area is preserved — while everything above the occlusion threshold keeps its
-per-segment detail.
+area is preserved — while the shell keeps its per-segment detail.
 
-On the curly groom (3.4 M strand splats, 1600x1200, PSNR against the unpooled
-render):
+Two things decide whether the groom still looks like itself afterwards.
 
-| threshold | splats | PSNR | frame |
-|---|---|---|---|
-| none | 3.39 M | reference | 777 ms |
-| 0.2 | 760 k (4.5x fewer) | 43 dB | 147 ms |
-| 0.35 | 294 k (11.5x fewer) | 30 dB | — |
+**What counts as buried is relative to the groom.** The occlusion a splat reads
+depends on how dense the groom around it is: the straight groom leaves its
+outermost splats at ~0.4, while the 50 k-strand curly one buries even its own
+silhouette below 0.3 (94% of its splats sit under 0.3, and its most open 10%
+only reach 0.275). An absolute threshold therefore pools the deep interior of
+one groom and the whole of another — which is what made a dense groom come back
+as a dark, shiny blob. `relative_openness` is measured against the groom's own
+most open splats (the 95th percentile of its occlusion), so the setting means
+the same thing at any density and the shell is always spared. Both the CPU and
+GPU poolers resolve it from the same 256-bin histogram, so they agree exactly.
 
-4.5x fewer splats at 43 dB is a better trade than the grid merge below ever
-managed, because it spends detail where it shows. Above ~0.35 the coarse blobs
-start showing through thin parts of the shell as soft patches. It needs the
-occlusion bake first, and the button says so.
+**Clusters follow the strands.** Splats only pool with others pointing the same
+way (`direction_bins`), and a cluster may run several cells along a strand but
+only one across it (`along_cells`). A cluster that spans neighbouring strands
+merges them into a ribbon and the groom loses its striping; one that runs along
+a strand does not.
+
+On the curly groom at its full 50 k strands (7 M strand splats, 1600x1200, PSNR
+against the unpooled render):
+
+| interior below | splats | PSNR (front / close) |
+|---|---|---|
+| none | 7.00 M | reference |
+| 0.4 | 2.08 M (3.4x fewer) | 56.4 / 51.9 dB |
+| 0.6 | 1.48 M (4.7x fewer) | 52.6 / 49.0 dB |
+| 0.9 | 983 k (7.1x fewer) | 44.5 / 39.7 dB |
+
+For comparison, the absolute threshold this replaced scored 35.9 / 30.1 dB on
+the same groom. The sparser straight groom has far less true interior, so it
+pools less for the same quality: 2.1x fewer splats at 33.9 dB at the default.
+Pooling needs the occlusion bake first, and the button says so.
 
 Pooling runs on the GPU (`src/gpu/pool.rs`): rather than accumulate per cell
 with atomics — WGSL has no float atomics — it keys each buried splat by its
 cell, sorts with the renderer's radix sorter, and gives one thread each run of
 equal keys, which accumulates its whole cluster in registers. 3.4 M splats pool
-in ~290 ms against ~790 ms for the CPU version in `src/merge.rs`, which stays as
+in ~300 ms against ~790 ms for the CPU version in `src/merge.rs`, which stays as
 the reference and the fallback.
 
 ### Merging similar splats

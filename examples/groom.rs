@@ -300,7 +300,7 @@ fn main() -> Result<()> {
         // Interior strands only carry bulk opacity: pool them into coarse
         // splats and leave the visible shell alone.
         let cfg = mesh2splat::merge::VolumeMergeSettings {
-            occlusion,
+            relative_openness: occlusion,
             ..Default::default()
         };
         // Build the pipelines before timing: that is shader compilation, not work.
@@ -334,6 +334,15 @@ fn main() -> Result<()> {
     let splats = gb.download(&ctx);
     let mean_ao = splats.iter().map(|g| g.pbr[2] as f64).sum::<f64>() / splats.len().max(1) as f64;
     println!("mean occlusion {:.2} (1 = fully open)", mean_ao);
+    // Where the distribution sits matters more than the mean: it is what makes
+    // an absolute pooling threshold mean something different on a dense groom.
+    {
+        let q = |f| mesh2splat::merge::occlusion_quantile(splats.iter().map(|g| g.pbr[2]), f);
+        println!(
+            "occlusion quantiles: p25 {:.3} p50 {:.3} p75 {:.3} p95 {:.3}",
+            q(0.25), q(0.50), q(0.75), q(0.95)
+        );
+    }
     let widths: Vec<f32> = splats.iter().map(|g| g.scale[1] * 2.0).collect();
     let mean_width = widths.iter().sum::<f32>() / widths.len().max(1) as f32;
     let max_width = widths.iter().copied().fold(0.0f32, f32::max);

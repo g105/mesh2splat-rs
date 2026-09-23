@@ -8,7 +8,10 @@ use super::{
     compute_pipeline, dispatch_dims, shader_with_common, storage_entry, uniform_entry,
     GaussianBuffer, GpuContext,
 };
-use crate::merge::{MergeStats, VolumeMergeSettings};
+use crate::merge::{
+    quantile_from_histogram, MergeStats, VolumeMergeSettings, MAX_DIRECTION_BINS, OCCLUSION_BINS,
+    OPEN_QUANTILE,
+};
 use crate::types::BBox;
 
 #[repr(C)]
@@ -17,6 +20,7 @@ struct Params {
     bbox_min: [f32; 4],
     cell: [f32; 4],
     dims: [u32; 4],
+    bins: [u32; 4],
     tune: [f32; 4],
 }
 
@@ -24,6 +28,9 @@ const RUN_BYTES: u64 = 8;
 const GAUSSIAN_BYTES: u64 = 96;
 /// Cell indices have to fit a sort key: 1024^3 is comfortably inside u32.
 const MAX_GRID: u32 = 1024;
+/// Counters, then the occlusion histogram the buried fraction resolves against.
+const COUNTERS: u64 = 4;
+const COUNTER_BYTES: u64 = (COUNTERS + OCCLUSION_BINS as u64) * 4;
 /// Headroom for the fixed-point size reduction: every splat contributes at
 /// most `SIZE_BUDGET / count`, so the sum cannot overflow a u32.
 const SIZE_BUDGET: f64 = 4.0e9;
@@ -100,7 +107,12 @@ impl GpuPooler {
                 mapped_at_creation: false,
             }),
             count: storage(device, "pool count", 16, U::COPY_DST),
-            counters: storage(device, "pool counters", 16, U::COPY_DST | U::COPY_SRC),
+            counters: storage(
+                device,
+                "pool counters",
+                COUNTER_BYTES,
+                U::COPY_DST | U::COPY_SRC,
+            ),
             scratch: None,
         }
     }
@@ -144,8 +156,15 @@ impl GpuPooler {
             bbox_min: min.extend(0.0).to_array(),
             cell: [1.0; 4],
             dims: [1, count, cfg.min_cluster.max(2) as u32, 0],
+            bins: [
+                cfg.direction_bins.clamp(1, MAX_DIRECTION_BINS),
+                cfg.along_cells.max(1),
+                0,
+                0,
+            ],
             tune: [
-                cfg.occlusion,
+                // Resolved from the histogram the measure pass builds.
+                0.0,
                 (SIZE_BUDGET / count as f64) as f32,
                 size.max_element(),
                 0.0,
@@ -198,11 +217,13 @@ impl GpuPooler {
             dispatch(&mut pass, &self.measure, count, 256);
         }
         ctx.queue.submit([enc.finish()]);
-        let total = u32::from_le_bytes(
-            ctx.read_buffer(&self.counters, 12, 4)[..4]
-                .try_into()
-                .unwrap(),
-        );
+        let measured = ctx.read_buffer(&self.counters, 0, COUNTER_BYTES);
+        let measured: &[u32] = bytemuck::cast_slice(&measured);
+        let total = measured[3];
+        // Same histogram and the same bin edges as the CPU pooler, so both
+        // pick the same threshold for a given fraction.
+        params.tune[0] = cfg.relative_openness
+            * quantile_from_histogram(&measured[COUNTERS as usize..], count as u64, OPEN_QUANTILE);
         // Back out of the fixed point: mean fraction of the model, then units.
         let fixed = SIZE_BUDGET / count as f64;
         let mean_face = total as f64 / fixed / count as f64 * size.max_element() as f64;
@@ -224,8 +245,9 @@ impl GpuPooler {
             pass.set_bind_group(0, &bg, &[]);
             dispatch(&mut pass, &self.key, count, 256);
         }
-        // Cell indices fit in as many bits as the grid needs.
-        let bits = 64 - ((grid as u64).pow(3)).leading_zeros();
+        // Keys are 4 bits of direction bin over 3 x 9 bits of cell coordinate
+        // (see `key` in the shader), so the sort has 31 bits to look at.
+        let bits = 31;
         self.sorter.encode(&mut enc, bits);
         {
             let mut pass = enc.begin_compute_pass(&Default::default());

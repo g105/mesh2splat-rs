@@ -888,7 +888,7 @@ impl App {
                         if ui.button("Merge buried splats").on_hover_text("Splats the bake found buried contribute bulk opacity but no silhouette: pool them into coarse splats that fill the same volume and stop the same amount of light. The visible shell keeps its detail.").clicked() {
                             self.merge_occluded_splats();
                         }
-                        ui.add(egui::Slider::new(&mut self.volume_merge.occlusion, 0.0..=0.8).text("below occlusion"));
+                        ui.add(egui::Slider::new(&mut self.volume_merge.relative_openness, 0.0..=1.0).text("interior below")).on_hover_text("How buried a splat has to be, measured against this groom's own most open splats, before it is pooled. Relative rather than absolute: a dense groom buries even its own silhouette, so a fixed threshold would pool the whole of it and the groom would stop looking like itself.");
                     });
                     ui.checkbox(&mut self.settings.ambient_occlusion, "Use baked occlusion")
                         .on_hover_text("Ambient light reaches a splat only as far as the bake says it is open. Exact with forward shading; the deferred path folds it into the colour, which dims direct light too.");

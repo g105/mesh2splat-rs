@@ -200,9 +200,24 @@ fn min_eigenvalue(m: DMat3) -> f64 {
 
 /// Rotation (w, x, y, z) and scales of a splat with the given covariance.
 fn splat_from_covariance(cov: DMat3) -> ([f32; 4], [f32; 3]) {
+    splat_from_covariance_along(cov, DVec3::ZERO)
+}
+
+/// As [`splat_from_covariance`], with the long axis turned to point along
+/// `along`. An eigenvector's sign is arbitrary, but a strand's tangent runs
+/// root to tip, and the renderer averages tangents across a pixel: a cluster
+/// pointing back would cancel the strands around it.
+fn splat_from_covariance_along(cov: DMat3, along: DVec3) -> ([f32; 4], [f32; 3]) {
     let (vals, mut vecs) = eigen_sym(cov);
     if vecs.determinant() < 0.0 {
         vecs.z_axis = -vecs.z_axis;
+    }
+    let k = (0..3).max_by(|&a, &b| vals[a].total_cmp(&vals[b])).unwrap();
+    if vecs.col(k).dot(along) < 0.0 {
+        // Two axes at once, so the frame stays right-handed.
+        *vecs.col_mut(k) = -vecs.col(k);
+        let j = (k + 1) % 3;
+        *vecs.col_mut(j) = -vecs.col(j);
     }
     let q = Quat::from_mat3(&Mat3::from_cols(
         vecs.x_axis.as_vec3(),
@@ -906,13 +921,19 @@ fn oct_encode(n: DVec3) -> (f64, f64) {
     (x * 0.5 + 0.5, y * 0.5 + 0.5)
 }
 
-/// Which bin a splat's long axis falls in. Splats only pool with others
-/// pointing the same way, so a cluster of strands stays long and thin.
-fn direction_bin(g: &GaussianVertex, bins: u32) -> (i64, DVec3) {
+/// A splat's longest axis, with the sign its rotation gives it: for a strand
+/// splat, the direction from root to tip.
+fn long_axis(g: &GaussianVertex) -> DVec3 {
     let longest = (0..3)
         .max_by(|&a, &b| g.scale[a].total_cmp(&g.scale[b]))
         .unwrap();
-    let mut axis = splat_axes(g.rotation).col(longest);
+    splat_axes(g.rotation).col(longest)
+}
+
+/// Which bin a splat's long axis falls in. Splats only pool with others
+/// pointing the same way, so a cluster of strands stays long and thin.
+fn direction_bin(g: &GaussianVertex, bins: u32) -> (i64, DVec3) {
+    let mut axis = long_axis(g);
     // Direction is unsigned: a strand pointing back is the same strand.
     if axis.z < 0.0 {
         axis = -axis;
@@ -968,6 +989,8 @@ struct Cluster {
     sum_pp: Sym,
     sum_color: [f64; 3],
     sum_normal: DVec3,
+    /// Weighted sum of the members' long axes, signs kept.
+    sum_axis: DVec3,
     sum_pbr: [f64; 2],
     sum_ao: f64,
     extinction: f64,
@@ -1107,6 +1130,7 @@ pub fn merge_occluded(
             c.sum_color[k] += g.color[k] as f64 * w;
         }
         c.sum_normal += DVec3::new(g.normal[0] as f64, g.normal[1] as f64, g.normal[2] as f64) * w;
+        c.sum_axis += long_axis(g) * w;
         c.sum_pbr[0] += g.pbr[0] as f64 * w;
         c.sum_pbr[1] += g.pbr[1] as f64 * w;
         c.sum_ao += g.pbr[2] as f64 * w;
@@ -1126,7 +1150,7 @@ pub fn merge_occluded(
         let spread =
             unsym(&c.sum_pp) * inv - DMat3::from_cols(mean * mean.x, mean * mean.y, mean * mean.z);
         let cov = unsym(&c.sum_cov) * inv + spread;
-        let (rotation, scale) = splat_from_covariance(cov);
+        let (rotation, scale) = splat_from_covariance_along(cov, c.sum_axis);
         // Keep the volume as opaque as the strands were: the coarse splat has a
         // much bigger face, so it needs proportionally less opacity.
         let (a, b) = splat_face([scale[0], scale[1], scale[2], 0.0]);

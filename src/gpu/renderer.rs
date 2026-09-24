@@ -1,6 +1,6 @@
 //! Gaussian splat renderer (port of the original render passes):
-//! depth prepass -> mesh G-buffer -> gaussian prepass -> radix sort ->
-//! splat G-buffer -> point-light shadow cube -> deferred shading.
+//! depth prepass -> mesh G-buffer -> point-light shadow cube ->
+//! gaussian prepass -> radix sort -> splat G-buffer -> deferred shading.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -23,6 +23,13 @@ const POS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const ALBEDO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const MR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// World-space strand direction, biased into [0, 1]. Eight bits are plenty for
+/// a direction, and the splat raster is bound by the bytes it blends. WebGPU
+/// counts each of these targets as 8 bytes a pixel and only guarantees 32,
+/// which the other four already take; adapters that allow no more (Intel and
+/// AMD Macs) go without it.
+const TANGENT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const GBUFFER_BYTES_WITH_TANGENT: u32 = 40;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Opacity shadow map slices (four distance bands of absorbed light).
 const OSM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -80,8 +87,8 @@ pub struct RenderSettings {
     /// Applies to the normal PBR model, for brushed metal and hair cards.
     pub anisotropy: f32,
     /// Use the occlusion baked into the splats (see [`super::ao::AoBaker`]).
-    /// Exact in the forward path; in the deferred path it folds into the
-    /// colour, which dims direct light too.
+    /// Dims ambient light only, in both paths; the deferred path has no room
+    /// for the bent normal and uses the averaged normal instead.
     pub ambient_occlusion: bool,
     /// Shade every splat in the splat pass instead of once per pixel after it.
     /// Each splat uses its own normal and tangent, so overlapping strands blend
@@ -173,7 +180,7 @@ struct FrameUniform {
     depth_test: u32,
     sort_min: f32,
     sort_scale: f32,
-    ao_deferred: f32,
+    use_ao: f32,
     _p: [f32; 3],
 }
 
@@ -213,8 +220,8 @@ struct LightingUniform {
     forward: u32,
     transmission: f32,
     shadow_density: f32,
-    // `attenuation` is a vec4 and so starts on a 16-byte boundary.
-    _pad: u32,
+    /// 1 when the splat pass wrote the tangent target this frame.
+    tangents: u32,
     attenuation: [f32; 4],
     fibre: [f32; 4],
     sheen: [f32; 4],
@@ -267,6 +274,7 @@ struct GBuffer {
     normal: Tex,
     albedo: Tex,
     mr: Tex,
+    tangent: Tex,
 }
 
 impl GBuffer {
@@ -283,10 +291,11 @@ impl GBuffer {
                 MR_FORMAT,
                 u,
             ),
+            tangent: make_tex(device, &format!("{label} tangent"), size, TANGENT_FORMAT, u),
         }
     }
 
-    fn attachments(&self) -> [Option<wgpu::RenderPassColorAttachment<'_>>; 4] {
+    fn attachments(&self, tangent: bool) -> Vec<Option<wgpu::RenderPassColorAttachment<'_>>> {
         let att = |v| {
             Some(wgpu::RenderPassColorAttachment {
                 view: v,
@@ -298,12 +307,25 @@ impl GBuffer {
                 },
             })
         };
-        [
+        let mut atts = vec![
             att(&self.pos.view),
             att(&self.normal.view),
             att(&self.albedo.view),
             att(&self.mr.view),
-        ]
+        ];
+        if tangent {
+            atts.push(att(&self.tangent.view));
+        }
+        atts
+    }
+
+    /// What the forward pipeline draws into (see [`forward_targets`]).
+    fn forward_attachments(&self) -> Vec<Option<wgpu::RenderPassColorAttachment<'_>>> {
+        let mut atts = self.attachments(false);
+        atts.truncate(3);
+        atts[0] = None;
+        atts[1] = None;
+        atts
     }
 }
 
@@ -358,6 +380,8 @@ struct StatsReadback {
 }
 
 pub struct Renderer {
+    /// Whether the G-buffer has room for the strand tangent.
+    tangent_target: bool,
     frame_buf: wgpu::Buffer,
     shadow_frame_buf: wgpu::Buffer,
     lighting_buf: wgpu::Buffer,
@@ -374,6 +398,8 @@ pub struct Renderer {
     splat_light_bgl: wgpu::BindGroupLayout,
     splat_light_bg: Option<wgpu::BindGroup>,
     splat_overdraw: wgpu::RenderPipeline,
+    /// `splat` with the tangent target, where the adapter has room for it.
+    splat_tangent: Option<wgpu::RenderPipeline>,
     mesh_gbuffer: wgpu::RenderPipeline,
     mesh_depth: wgpu::RenderPipeline,
     shadow_project: wgpu::ComputePipeline,
@@ -414,7 +440,10 @@ fn blend(src: wgpu::BlendFactor, dst: wgpu::BlendFactor) -> wgpu::BlendState {
     wgpu::BlendState { color: c, alpha: c }
 }
 
-fn gbuffer_targets(blend: Option<wgpu::BlendState>) -> [Option<wgpu::ColorTargetState>; 4] {
+/// Without the tangent target the shaders still write it, and the output is
+/// dropped; the deferred pass then reads the never-written (zero) texture and
+/// falls back to any direction in the plane of the normal.
+fn gbuffer_targets(blend: Option<wgpu::BlendState>, tangent: bool) -> Vec<Option<wgpu::ColorTargetState>> {
     let t = |format| {
         Some(wgpu::ColorTargetState {
             format,
@@ -422,11 +451,25 @@ fn gbuffer_targets(blend: Option<wgpu::BlendState>) -> [Option<wgpu::ColorTarget
             write_mask: wgpu::ColorWrites::ALL,
         })
     };
-    [
-        t(POS_FORMAT),
-        t(NORMAL_FORMAT),
-        t(ALBEDO_FORMAT),
-        t(MR_FORMAT),
+    let mut targets = vec![t(POS_FORMAT), t(NORMAL_FORMAT), t(ALBEDO_FORMAT), t(MR_FORMAT)];
+    if tangent {
+        targets.push(t(TANGENT_FORMAT));
+    }
+    targets
+}
+
+/// Forward shading writes shaded colour into the albedo slot and nothing else:
+/// the deferred pass only composites it, so the rest would be bandwidth spent
+/// on the costliest pass for nothing.
+fn forward_targets(blend: wgpu::BlendState) -> Vec<Option<wgpu::ColorTargetState>> {
+    vec![
+        None,
+        None,
+        Some(wgpu::ColorTargetState {
+            format: ALBEDO_FORMAT,
+            blend: Some(blend),
+            write_mask: wgpu::ColorWrites::ALL,
+        }),
     ]
 }
 
@@ -492,6 +535,8 @@ impl Renderer {
     pub fn new(ctx: &GpuContext) -> Self {
         let device = &ctx.device;
         use wgpu::ShaderStages as S;
+        let tangent_target =
+            device.limits().max_color_attachment_bytes_per_sample >= GBUFFER_BYTES_WITH_TANGENT;
 
         // --- layouts
         let prepass_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -579,6 +624,8 @@ impl Renderer {
                     wgpu::TextureSampleType::Float { filterable: false },
                     wgpu::TextureViewDimension::D2Array,
                 ),
+                float_tex(11),
+                float_tex(12),
             ],
         });
         let mesh_bgl = mesh_bind_group_layout(device);
@@ -616,7 +663,7 @@ impl Renderer {
             ],
         });
         let splat_layout = pipeline_layout(device, "splat", &[&splat_bgl, &splat_light_bgl]);
-        let make_splat = |b: wgpu::BlendState, label: &str, entry: &str| {
+        let make_splat = |targets: &[Option<wgpu::ColorTargetState>], label: &str, entry: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&splat_layout),
@@ -638,7 +685,7 @@ impl Renderer {
                     module: &splat_mod,
                     entry_point: Some(entry),
                     compilation_options: Default::default(),
-                    targets: &gbuffer_targets(Some(b)),
+                    targets,
                 }),
                 multiview_mask: None,
                 cache: None,
@@ -646,10 +693,16 @@ impl Renderer {
         };
         // Front-to-back "under" blending (Bernhard Kerbl's 3DGS tutorial, slide 25).
         let under = blend(wgpu::BlendFactor::OneMinusDstAlpha, wgpu::BlendFactor::One);
-        let splat = make_splat(under, "splat", "fs_main");
-        let splat_forward = make_splat(under, "splat forward", "fs_forward");
+        // Only shading that reads the tangent pays for the target: the splat
+        // raster is bound by the bytes it blends, and one more target costs it
+        // nearly half again.
+        let splat = make_splat(&gbuffer_targets(Some(under), false), "splat", "fs_main");
+        let splat_tangent = tangent_target.then(|| {
+            make_splat(&gbuffer_targets(Some(under), true), "splat with tangent", "fs_main")
+        });
+        let splat_forward = make_splat(&forward_targets(under), "splat forward", "fs_forward");
         let splat_overdraw = make_splat(
-            blend(wgpu::BlendFactor::One, wgpu::BlendFactor::One),
+            &gbuffer_targets(Some(blend(wgpu::BlendFactor::One, wgpu::BlendFactor::One)), false),
             "splat overdraw",
             "fs_main",
         );
@@ -683,7 +736,7 @@ impl Renderer {
                 module: &mesh_mod,
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
-                targets: &gbuffer_targets(None),
+                targets: &gbuffer_targets(None, tangent_target),
             }),
             multiview_mask: None,
             cache: None,
@@ -992,12 +1045,14 @@ impl Renderer {
             face_counts,
             shadow_args,
             sorter: RadixSorter::new(ctx),
+            tangent_target,
             prepass,
             splat,
             splat_forward,
             splat_light_bgl,
             splat_light_bg: None,
             splat_overdraw,
+            splat_tangent,
             mesh_gbuffer,
             mesh_depth,
             shadow_project,
@@ -1161,6 +1216,8 @@ impl Renderer {
                     e(8, tv(&t.mesh.mr.view)),
                     e(9, tv(&self.shadow_array)),
                     e(10, tv(&self.osm_array)),
+                    e(11, tv(&t.splat.tangent.view)),
+                    e(12, tv(&t.mesh.tangent.view)),
                 ],
             });
             self.bind_groups = Some(BindGroups {
@@ -1219,6 +1276,13 @@ impl Renderer {
         self.ensure_targets(device, size);
         self.ensure_gaussian_resources(ctx, gaussians.capacity);
         let lighting = settings.lighting && settings.render_mode == RenderMode::Final;
+        let forward = settings.forward_shading && lighting;
+        // Deferred shading that reads the tangent; forward shading has each
+        // splat's own.
+        let tangents = self.splat_tangent.is_some()
+            && lighting
+            && !forward
+            && (settings.hair_shading || settings.anisotropy > 0.0);
         if lighting {
             self.ensure_shadow_resources(device, gaussians.capacity);
         }
@@ -1277,8 +1341,7 @@ impl Renderer {
             depth_test: depth_test as u32,
             sort_min,
             sort_scale,
-            // The forward path applies occlusion itself, to ambient only.
-            ao_deferred: (settings.ambient_occlusion && !settings.forward_shading) as u32 as f32,
+            use_ao: settings.ambient_occlusion as u32 as f32,
             _p: [0.0; 3],
         };
         ctx.queue
@@ -1307,7 +1370,7 @@ impl Renderer {
             forward: (settings.forward_shading && lighting) as u32,
             transmission: settings.transmission,
             shadow_density: settings.shadow_density,
-            _pad: 0,
+            tangents: tangents as u32,
             attenuation: settings
                 .attenuation_color
                 .extend(settings.attenuation_distance)
@@ -1407,7 +1470,7 @@ impl Renderer {
                     beginning_of_pass_write_index: Some(0),
                     end_of_pass_write_index: None,
                 });
-            let atts = t.mesh.attachments();
+            let atts = t.mesh.attachments(self.tangent_target);
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("mesh gbuffer"),
                 color_attachments: &atts,
@@ -1431,77 +1494,23 @@ impl Renderer {
             }
         }
 
-        // --- 3/4. gaussian prepass + sort
-        enc.clear_buffer(&self.counters, 0, None);
-        let mut prepass_begin_slot = None;
-        if count > 0 {
-            let ts = qs.map(|q| {
-                let slot = if begin_ts() { TS_FRAME_BEGIN } else { TS_PREPASS_BEGIN };
-                prepass_begin_slot = Some(slot);
-                wgpu::ComputePassTimestampWrites {
-                    query_set: q,
-                    beginning_of_pass_write_index: Some(slot),
-                    end_of_pass_write_index: Some(TS_PREPASS_END),
-                }
-            });
-            {
-                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("gaussian prepass"),
-                    timestamp_writes: ts,
-                });
-                pass.set_pipeline(&self.prepass);
-                pass.set_bind_group(0, &bg.prepass, &[]);
-                let (x, y) = dispatch_dims(count.div_ceil(256));
-                pass.dispatch_workgroups(x, y, 1);
-            }
-            self.sorter.encode(enc, key_bits);
-        }
-
-        // --- 5. splats -> G-buffer
-        {
-            // The splat pass is never first when the prepass ran, so its begin
-            // slot only doubles as the frame begin for empty frames.
-            let ts = qs.map(|q| wgpu::RenderPassTimestampWrites {
-                query_set: q,
-                beginning_of_pass_write_index: Some(if begin_ts() {
-                    TS_FRAME_BEGIN
-                } else {
-                    TS_SPLAT_BEGIN
-                }),
-                end_of_pass_write_index: Some(TS_SPLAT_END),
-            });
-            let atts = t.splat.attachments();
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("splat gbuffer"),
-                color_attachments: &atts,
-                depth_stencil_attachment: None,
-                timestamp_writes: ts,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            if count > 0 {
-                let forward = settings.forward_shading && lighting;
-                pass.set_pipeline(if settings.render_mode == RenderMode::Overdraw {
-                    &self.splat_overdraw
-                } else if forward {
-                    &self.splat_forward
-                } else {
-                    &self.splat
-                });
-                pass.set_bind_group(0, &bg.splat, &[]);
-                pass.set_bind_group(1, self.splat_light_bg.as_ref().unwrap(), &[]);
-                pass.draw_indirect(&self.sorter.args, DRAW_ARGS_OFFSET);
-            }
-        }
-
-        // --- 6. point light shadow cube map
+        // --- 3. point light shadow cube map
+        // Ahead of the splats: forward shading reads it in the splat pass, and
+        // would otherwise see the previous frame's (on the first, an empty one).
         if lighting {
             let (shadow_compute, shadow_draw) = bg.shadow.as_ref().expect("shadow bind groups");
             enc.clear_buffer(&self.face_counts, 0, None);
             if count > 0 {
+                let ts = qs
+                    .filter(|_| begin_ts())
+                    .map(|q| wgpu::ComputePassTimestampWrites {
+                        query_set: q,
+                        beginning_of_pass_write_index: Some(TS_FRAME_BEGIN),
+                        end_of_pass_write_index: None,
+                    });
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("shadow prepass"),
-                    timestamp_writes: None,
+                    timestamp_writes: ts,
                 });
                 pass.set_bind_group(0, shadow_compute, &[]);
                 let (x, y) = dispatch_dims(count.div_ceil(256));
@@ -1555,7 +1564,75 @@ impl Renderer {
             }
         }
 
-        // --- 7. deferred shading / composite
+        // --- 4. gaussian prepass + sort
+        enc.clear_buffer(&self.counters, 0, None);
+        let mut prepass_begin_slot = None;
+        if count > 0 {
+            let ts = qs.map(|q| {
+                let slot = if begin_ts() { TS_FRAME_BEGIN } else { TS_PREPASS_BEGIN };
+                prepass_begin_slot = Some(slot);
+                wgpu::ComputePassTimestampWrites {
+                    query_set: q,
+                    beginning_of_pass_write_index: Some(slot),
+                    end_of_pass_write_index: Some(TS_PREPASS_END),
+                }
+            });
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("gaussian prepass"),
+                    timestamp_writes: ts,
+                });
+                pass.set_pipeline(&self.prepass);
+                pass.set_bind_group(0, &bg.prepass, &[]);
+                let (x, y) = dispatch_dims(count.div_ceil(256));
+                pass.dispatch_workgroups(x, y, 1);
+            }
+            self.sorter.encode(enc, key_bits);
+        }
+
+        // --- 5. splats -> G-buffer
+        {
+            // The splat pass is never first when the prepass ran, so its begin
+            // slot only doubles as the frame begin for empty frames.
+            let ts = qs.map(|q| wgpu::RenderPassTimestampWrites {
+                query_set: q,
+                beginning_of_pass_write_index: Some(if begin_ts() {
+                    TS_FRAME_BEGIN
+                } else {
+                    TS_SPLAT_BEGIN
+                }),
+                end_of_pass_write_index: Some(TS_SPLAT_END),
+            });
+            let atts = if forward {
+                t.splat.forward_attachments()
+            } else {
+                t.splat.attachments(tangents)
+            };
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("splat gbuffer"),
+                color_attachments: &atts,
+                depth_stencil_attachment: None,
+                timestamp_writes: ts,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if count > 0 {
+                pass.set_pipeline(if settings.render_mode == RenderMode::Overdraw {
+                    &self.splat_overdraw
+                } else if forward {
+                    &self.splat_forward
+                } else if tangents {
+                    self.splat_tangent.as_ref().unwrap()
+                } else {
+                    &self.splat
+                });
+                pass.set_bind_group(0, &bg.splat, &[]);
+                pass.set_bind_group(1, self.splat_light_bg.as_ref().unwrap(), &[]);
+                pass.draw_indirect(&self.sorter.args, DRAW_ARGS_OFFSET);
+            }
+        }
+
+        // --- 6. deferred shading / composite
         {
             let ts = qs.map(|q| wgpu::RenderPassTimestampWrites {
                 query_set: q,

@@ -36,7 +36,7 @@ struct Quad {
     extent: u32,           // pack2x16float: half-axis lengths in standard deviations
     color: u32,            // pack4x8unorm rgba (a = opacity)
     normal: u32,           // pack2x16unorm of the octahedral world normal
-    metal_rough: u32,      // pack4x8unorm (metallic, roughness, tangent angle, 0)
+    metal_rough: u32,      // 8-bit metallic, 8-bit roughness, 16-bit tangent (see `pack_material`)
     /// Baked shading data: octahedral bent normal in 2 x 12 bits, then 8 bits
     /// of ambient occlusion (see `pack_ao_bent`).
     ao_bent: u32,
@@ -197,17 +197,24 @@ fn plane_basis(n: vec3<f32>) -> mat2x3<f32> {
     return mat2x3<f32>(b0, cross(n, b0));
 }
 
-/// Direction in the plane of `n` -> [0, 1). Hair tangents are unsigned, so the
-/// angle folds at pi and 8 bits are enough for ~0.7 degrees.
-fn encode_tangent(n: vec3<f32>, t: vec3<f32>) -> f32 {
+/// Metallic and roughness in a byte each, then the tangent as an angle in the
+/// plane of `n` in the top 16 bits. The angle keeps its sign: a strand's
+/// tangent runs root to tip, which is what lets neighbouring strands' tangents
+/// be averaged in the G-buffer (and what the hair lobes shift towards).
+fn pack_material(metal_rough: vec2<f32>, n: vec3<f32>, t: vec3<f32>) -> u32 {
     let b = plane_basis(n);
-    let a = atan2(dot(t, b[1]), dot(t, b[0]));
-    return fract(select(a, a + 3.14159265, a < 0.0) / 3.14159265);
+    let a = atan2(dot(t, b[1]), dot(t, b[0])) / (2.0 * 3.14159265);
+    let angle = u32(round(fract(a) * 65536.0)) & 0xffffu;
+    return (pack4x8unorm(vec4<f32>(metal_rough, 0.0, 0.0)) & 0xffffu) | (angle << 16u);
 }
 
-fn decode_tangent(n: vec3<f32>, angle: f32) -> vec3<f32> {
+fn unpack_metal_rough(v: u32) -> vec2<f32> {
+    return unpack4x8unorm(v).xy;
+}
+
+fn unpack_tangent(n: vec3<f32>, v: u32) -> vec3<f32> {
     let b = plane_basis(n);
-    let a = angle * 3.14159265;
+    let a = f32(v >> 16u) / 65536.0 * (2.0 * 3.14159265);
     return normalize(b[0] * cos(a) + b[1] * sin(a));
 }
 

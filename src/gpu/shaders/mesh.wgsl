@@ -48,6 +48,7 @@ struct GBufferOut {
     @location(1) normal: vec4<f32>,
     @location(2) albedo: vec4<f32>,
     @location(3) metal_rough: vec4<f32>,
+    @location(4) tangent: vec4<f32>,
 };
 
 fn hash(x: f32) -> f32 {
@@ -92,6 +93,8 @@ fn fs_main(in: VsOut) -> GBufferOut {
     out.position = vec4<f32>(in.world_pos, 1.0);
     out.normal = vec4<f32>(encoded, 1.0);
     out.albedo = vec4<f32>(color.rgb, 1.0);
-    out.metal_rough = vec4<f32>(metal_rough, 0.0, 1.0);
+    // Meshes carry no baked occlusion: fully open.
+    out.metal_rough = vec4<f32>(metal_rough, 1.0, 1.0);
+    out.tangent = vec4<f32>(in.tangent.xyz / max(length(in.tangent.xyz), 1e-8) * 0.5 + 0.5, 1.0);
     return out;
 }

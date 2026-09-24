@@ -23,6 +23,8 @@
 @group(0) @binding(8) var m_mr: texture_2d<f32>;
 @group(0) @binding(9) var shadow_map: texture_depth_2d_array;
 @group(0) @binding(10) var opacity_map: texture_2d_array<f32>;
+@group(0) @binding(11) var s_tangent: texture_2d<f32>;
+@group(0) @binding(12) var m_tangent: texture_2d<f32>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
@@ -104,16 +106,19 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     var nrm_s: vec4<f32>;
     var alb_s: vec4<f32>;
     var mr_s: vec4<f32>;
+    var tan_s: vec4<f32>;
     if (use_mesh) {
         pos_s = textureLoad(m_pos, px, 0);
         nrm_s = textureLoad(m_normal, px, 0);
         alb_s = textureLoad(m_albedo, px, 0);
         mr_s = textureLoad(m_mr, px, 0);
+        tan_s = textureLoad(m_tangent, px, 0);
     } else {
         pos_s = textureLoad(s_pos, px, 0);
         nrm_s = textureLoad(s_normal, px, 0);
         alb_s = textureLoad(s_albedo, px, 0);
         mr_s = textureLoad(s_mr, px, 0);
+        tan_s = textureLoad(s_tangent, px, 0);
     }
     let alpha = alb_s.a;
     let eps = 1e-6;
@@ -134,6 +139,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let mr = mr_s.rgb / max(mr_s.a, eps);
     let metallic = mr.x;
     let roughness = mr.y;
+    let ao = mr.z;
 
     // Graded (opacity) or binary (depth) self-shadowing.
     var shadow = 0.0;
@@ -154,7 +160,13 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let d = length(lt.light_pos.xyz - pos);
     let radiance = lt.light_color.rgb * lt.light_color.w / (d * d);
 
-    let t = decode_tangent(n, mr.z);
+    // Strands crossing at a pixel can average to nothing: any direction in
+    // the plane of the normal is then as good as another. So can a G-buffer
+    // without the tangent, which only shading that reads it pays for.
+    let has_tangent = lt.tangents == 1u && tan_s.a > eps;
+    let t_avg = select(vec3<f32>(0.0), tan_s.xyz / max(tan_s.a, eps) * 2.0 - 1.0, has_tangent);
+    let t_flat = t_avg - n * dot(n, t_avg);
+    let t = select(plane_basis(n)[0], normalize(t_flat), length(t_flat) > 1e-3);
     var lo = vec3<f32>(0.0);
     if (lt.hair == 1u) {
         lo = hair_lighting(t, n, v, l, albedo, lt.fibre.yz, f0_from_ior(lt.fibre.x), lt.fibre.w);
@@ -167,6 +179,9 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     if (through > 0.0) {
         lo += transmission_term(v, l, albedo, through, tint) * radiance;
     }
-    let color = tonemap(vec3<f32>(0.3) * albedo + lo);
+    // Ambient only reaches a pixel as far as the bake says it is open. (The
+    // forward path also weighs it by the bent normal, which there is no room
+    // for here.)
+    let color = tonemap(vec3<f32>(0.3 * ao) * albedo + lo);
     return over_background(color * alpha, alpha);
 }

@@ -67,8 +67,17 @@ them as surfaces reads as felt. Three settings (all off by default) target that:
 
 * **Anisotropic (hair) shading** — Kajiya-Kay: both the diffuse and the two
   specular lobes work off the angle to each splat's longest axis instead of its
-  normal. The tangent rides through the G-buffer as an angle in the plane of the
-  normal, packed into a channel that was previously written as zero. The two
+  normal. The tangent runs root to tip and rides through the G-buffer as a
+  world-space vector in a target of its own, so the strands overlapping a pixel
+  average to the direction they share. (An angle would be cheaper, but angles
+  measured in each splat's own frame cannot be averaged, and averaging them is
+  what the G-buffer does: highlights came out sparkly and pointing the wrong
+  way.) The splat raster is bound by the bytes it blends, and the extra target
+  makes it about half as slow again, so only shading that reads the tangent
+  (hair, or anisotropy above 0) draws it. WebGPU guarantees only 32 bytes of
+  G-buffer a pixel, which the other targets already fill; adapters that allow no
+  more (Intel and AMD Macs) go without, and deferred hair highlights lose their
+  direction. The two
   lobes take separate roughnesses — sharp along the strand, broad across it,
   which is what reads as hair — and the primary keeps the colour of the light
   while the secondary carries the hair's, with Fresnel from the **index of
@@ -85,9 +94,9 @@ them as surfaces reads as felt. Three settings (all off by default) target that:
   weighted mean direction is the bent normal, both stored in spare `pbr`
   channels the splats already carry, so shading gets them for free. This is what
   stops the inside of a groom reading as one solid mass, and it is the largest
-  single improvement of the three. Exact with forward shading (ambient only);
-  the deferred path has no spare G-buffer channel, so it folds occlusion into
-  the colour, which dims direct light as well. 450 k splats bake in ~150 ms.
+  single improvement of the three. It dims ambient light only, in both paths;
+  only the bent normal is forward-only, and the deferred path uses the averaged
+  normal in its place. 450 k splats bake in ~150 ms.
 * **Transmission** is tinted by Beer-Lambert absorption over the optical depth
   the opacity shadows measure, so light that comes through deep hair takes the
   attenuation colour with it.
@@ -110,7 +119,14 @@ them as surfaces reads as felt. Three settings (all off by default) target that:
 | curly, close | 3.4 M | 153 ms | 333 ms |
 
   So it costs 2-4x the frame, all of it in the splat raster: worth it for a
-  close look at fine geometry, not for a full groom in motion.
+  close look at fine geometry, not for a full groom in motion. It writes only
+  the colour target, since nothing reads the rest of the G-buffer after it.
+
+  Pooling buried splats (below) changes the trade. On the curly groom at its
+  full 50 k strands (6.8 M splats), forward shading of the groom pooled at 0.6
+  (980 k splats) renders 2-5x faster than deferred shading of the unpooled one,
+  and scores 55 dB (front) / 51 dB (close) against forward shading of the
+  unpooled groom, where deferred shading scores 40 / 36 dB against it.
 
 Strand width and opacity come from the per-point values in the `.hair` file, so
 strands taper and see-through tips stay soft.
@@ -382,14 +398,16 @@ src/
     shaders/*.wgsl  ports of the GLSL shaders
 ```
 
-These are the frame passes in order, the same as the original:
+These are the frame passes in order, the same as the original except for the shadow map:
 
 1. Mesh depth prepass (optional).
 2. Mesh G-buffer (split-screen only).
-3. Gaussian prepass (projection, culling, EWA 2D covariance).
-4. Radix sort by view depth.
-5. Instanced quads, blended front-to-back with `(ONE_MINUS_DST_ALPHA, ONE)` into the G-buffer.
-6. Point-light cube shadow map.
+3. Point-light cube shadow map. The original drew it after the splats, which
+   is fine for deferred shading, but forward shading reads it during the splat
+   pass and would see the previous frame's.
+4. Gaussian prepass (projection, culling, EWA 2D covariance).
+5. Radix sort by view depth.
+6. Instanced quads, blended front-to-back with `(ONE_MINUS_DST_ALPHA, ONE)` into the G-buffer.
 7. Deferred GGX shading.
 
 The sort is fully GPU-driven. The visible count stays on the GPU, and the sort

@@ -201,10 +201,13 @@ fn emit_clusters(@builtin(global_invocation_id) gid3: vec3<u32>, @builtin(num_wo
     var pbr = vec2<f32>(0.0);
     var ao = 0.0;
     var stops = 0.0;
+    var along = vec3<f32>(0.0);
     for (var m = 0u; m < run.len; m++) {
         let g = gaussians[vals[run.start + m]];
         let w = max(extinction(g), 1e-12);
         weight += w;
+        let rot = cast_quat_to_mat3(g.rotation / max(length(g.rotation), 1e-20));
+        along += splat_axis(rot, longest_axis(g.scale.xyz)) * w;
         mean += g.position.xyz * w;
         color += g.color.rgb * w;
         normal += g.normal.xyz * w;
@@ -232,6 +235,15 @@ fn emit_clusters(@builtin(global_invocation_id) gid3: vec3<u32>, @builtin(num_wo
     var vecs = e.vectors;
     if (determinant(vecs) < 0.0) {
         vecs[2] = -vecs[2];
+    }
+    // An eigenvector's sign is arbitrary, but a strand's tangent runs root to
+    // tip and the renderer averages tangents across a pixel: turn the long
+    // axis along the members', and one more with it to stay right-handed.
+    let k = longest_axis(e.values);
+    if (dot(vecs[k], along) < 0.0) {
+        let j = (k + 1u) % 3u;
+        vecs[k] = -vecs[k];
+        vecs[j] = -vecs[j];
     }
     let scale = max(sqrt(max(e.values, vec3<f32>(0.0))), vec3<f32>(1e-7));
     // Keep the volume as opaque as the strands were: a much bigger face needs

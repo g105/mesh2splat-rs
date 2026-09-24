@@ -33,9 +33,9 @@ pub enum Command {
         /// Optional .glb/.gltf/.ply to open at startup.
         file: Option<PathBuf>,
     },
-    /// Convert a mesh (or a folder of meshes) to a 3DGS .ply.
+    /// Convert a mesh (or a folder of meshes) to a 3DGS .ply or .spz.
     Convert(ConvertArgs),
-    /// Render a mesh or .ply to a PNG without opening a window.
+    /// Render a mesh, .ply or .spz to a PNG without opening a window.
     Render(RenderArgs),
 }
 
@@ -48,6 +48,8 @@ pub enum FormatArg {
     Compressed,
     /// PlayCanvas / SuperSplat compressed PLY (~16 bytes per splat).
     Playcanvas,
+    /// Niantic .spz (20 bytes per splat before gzip).
+    Spz,
 }
 
 impl From<FormatArg> for PlyFormat {
@@ -58,6 +60,7 @@ impl From<FormatArg> for PlyFormat {
             FormatArg::Pbr => PlyFormat::Pbr,
             FormatArg::Compressed => PlyFormat::CompressedPbr,
             FormatArg::Playcanvas => PlyFormat::PlayCanvas,
+            FormatArg::Spz => PlyFormat::Spz,
         }
     }
 }
@@ -117,7 +120,7 @@ impl SamplingArgs {
 pub struct ConvertArgs {
     /// Input .glb/.gltf file, or a folder when --batch is given.
     pub input: PathBuf,
-    /// Output .ply (single file) or output folder (batch). Defaults next to the input.
+    /// Output .ply / .spz (single file) or output folder (batch). Defaults next to the input.
     #[arg(short, long)]
     pub output: Option<PathBuf>,
     /// Convert every .glb/.gltf in the input folder.
@@ -159,7 +162,7 @@ impl From<ModeArg> for RenderMode {
 
 #[derive(Args, Debug)]
 pub struct RenderArgs {
-    /// .glb/.gltf (converted first) or 3DGS .ply
+    /// .glb/.gltf (converted first), 3DGS .ply or .spz
     pub input: PathBuf,
     #[arg(short, long, default_value = "render.png")]
     pub output: PathBuf,
@@ -252,7 +255,7 @@ pub fn run_convert(args: ConvertArgs) -> Result<()> {
                 let rel = p
                     .strip_prefix(&args.input)
                     .unwrap_or(&p)
-                    .with_extension("ply");
+                    .with_extension(format.extension());
                 (p.clone(), out_dir.join(rel))
             })
             .collect()
@@ -260,7 +263,7 @@ pub fn run_convert(args: ConvertArgs) -> Result<()> {
         let out = args
             .output
             .clone()
-            .unwrap_or_else(|| args.input.with_extension("ply"));
+            .unwrap_or_else(|| args.input.with_extension(format.extension()));
         vec![(args.input.clone(), out)]
     };
     if jobs.is_empty() {

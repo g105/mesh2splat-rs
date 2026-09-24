@@ -243,7 +243,7 @@ fn main() -> Result<()> {
         let mult = gaussians.scale_multiplier(settings.gaussian_std);
         let mut sizes = Vec::new();
         for format in PlyFormat::ALL {
-            let path = args.out.join("export.ply");
+            let path = args.out.join(format!("export.{}", format.extension()));
             let t0 = Instant::now();
             ply::write_ply(&path, &splats, format, mult)?;
             let ms = t0.elapsed().as_secs_f64() * 1e3;

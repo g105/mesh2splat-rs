@@ -20,11 +20,11 @@
 //! We write version 3, the last one on gzip (version 4 switched to zstd and a
 //! new container); readers of version 4 still read 3.
 //!
-//! **Axes.** SPZ stores splats in RUB (x right, y up, z back), and tools that
-//! convert a 3DGS `.ply` to `.spz` treat the PLY as RDF (y down, z forward)
-//! and flip y and z. We do the same, so an exported `.spz` shows the same way
-//! up as the `.ply` of the same splats in any viewer, and reading it back
-//! undoes the flip.
+//! **Axes.** SPZ stores splats in RUB (x right, y up, z back), which is
+//! glTF's frame and so the one converted splats are already in: they are
+//! written as-is and come out upright in SPZ viewers. (Tools that convert a
+//! 3DGS `.ply` to `.spz` assume the PLY is RDF and flip y and z; we do not,
+//! so an `.spz` shows the other way up from the `.ply` of the same splats.)
 
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
@@ -48,11 +48,6 @@ const FRACTIONAL_BITS: u8 = 12;
 /// Largest magnitude a 24-bit signed fixed-point value holds.
 const MAX_FIXED: f32 = ((1 << 23) - 1) as f32;
 const FLAG_ANTIALIASED: u8 = 0x1;
-
-/// Flip of y and z between our (PLY, RDF) frame and SPZ's RUB frame. It is a
-/// 180 degree turn about x, so it is its own inverse and a proper rotation:
-/// positions flip y and z, and so do the quaternion's y and z.
-const FLIP: [f32; 3] = [1.0, -1.0, -1.0];
 
 fn to_u8(x: f32) -> u8 {
     // NaN (e.g. the log of a zero scale gone wrong) lands on 0 like -inf.
@@ -133,8 +128,8 @@ pub fn write_spz(w: impl Write, gs: &[GaussianVertex], m: f32) -> Result<()> {
 
     let fixed = (1u32 << bits) as f32;
     for g in gs {
-        for (p, s) in g.position.iter().zip(FLIP) {
-            let v = (p * s * fixed).round() as i32;
+        for p in &g.position[..3] {
+            let v = (p * fixed).round() as i32;
             z.write_all(&v.to_le_bytes()[..3])?;
         }
     }
@@ -157,8 +152,7 @@ pub fn write_spz(w: impl Write, gs: &[GaussianVertex], m: f32) -> Result<()> {
     bytes.clear();
     for g in gs {
         let [w, x, y, zz] = g.rotation;
-        let q = [x * FLIP[0], y * FLIP[1], zz * FLIP[2], w];
-        bytes.extend(pack_rotation(q).to_le_bytes());
+        bytes.extend(pack_rotation([x, y, zz, w]).to_le_bytes());
     }
     z.write_all(&bytes)?;
 
@@ -224,7 +218,7 @@ fn read_spz(raw: &[u8]) -> Result<Vec<GaussianVertex>> {
             let b = &pos[(i * 3 + k) * 3..][..3];
             // Sign-extend the 24-bit value.
             let v = i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8;
-            p[k] = v as f32 * fixed * FLIP[k];
+            p[k] = v as f32 * fixed;
         }
         p[3] = 1.0;
         let sh = Vec3::from_array(
@@ -246,7 +240,7 @@ fn read_spz(raw: &[u8]) -> Result<Vec<GaussianVertex>> {
             color: [c.x, c.y, c.z, alpha[i] as f32 / 255.0],
             scale: [s[0], s[1], s[2], 1.0],
             normal: [0.0; 4],
-            rotation: [w, x * FLIP[0], y * FLIP[1], z * FLIP[2]],
+            rotation: [w, x, y, z],
             pbr: [DEFAULT_METALLIC, DEFAULT_ROUGHNESS, 0.0, 1.0],
         });
     }
@@ -330,11 +324,11 @@ mod tests {
         assert_eq!(u32::from_le_bytes(raw[4..8].try_into().unwrap()), 3);
         assert_eq!(u32::from_le_bytes(raw[8..12].try_into().unwrap()), 1);
         assert_eq!(raw[12..16], [0, 12, 0, 0]);
-        // y and z are flipped into SPZ's RUB frame.
+        // Written as-is: glTF's y-up frame is SPZ's RUB.
         let fixed = |b: &[u8]| (i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) as f32 / 4096.0;
         assert_eq!(fixed(&raw[16..19]), 1.0);
-        assert_eq!(fixed(&raw[19..22]), -2.0);
-        assert_eq!(fixed(&raw[22..25]), -3.0);
+        assert_eq!(fixed(&raw[19..22]), 2.0);
+        assert_eq!(fixed(&raw[22..25]), 3.0);
         // 9 + 1 + 3 + 3 + 4 bytes per splat.
         assert_eq!(raw.len(), 16 + 20);
     }

@@ -69,13 +69,24 @@ fn convert_export_reload() {
 
     let dir = std::env::temp_dir();
     for fmt in PlyFormat::ALL {
-        let path = dir.join(format!("m2s_box_{}_{:?}.ply", std::process::id(), fmt));
+        let path = dir.join(format!(
+            "m2s_box_{}_{:?}.{}",
+            std::process::id(),
+            fmt,
+            fmt.extension()
+        ));
         let mult = gb.scale_multiplier(0.65);
         ply::write_ply(&path, &data, fmt, mult).unwrap();
         let back = ply::load_gaussian_ply(&path).unwrap();
         assert_eq!(back.gaussians.len(), data.len());
         let expected_sx = data[10].scale[0] * mult;
-        assert!((back.gaussians[10].scale[0] - expected_sx).abs() / expected_sx < 1e-4);
+        // SPZ stores log scales in steps of 1/16.
+        let tol = if fmt == PlyFormat::Spz { 1.0 / 32.0 + 1e-4 } else { 1e-4 };
+        assert!(
+            (back.gaussians[10].scale[0] / expected_sx).ln().abs() < tol,
+            "{fmt:?}: {} vs {expected_sx}",
+            back.gaussians[10].scale[0]
+        );
         std::fs::remove_file(&path).ok();
     }
 }

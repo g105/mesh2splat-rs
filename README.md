@@ -2,7 +2,7 @@
 
 A Rust port of [EA SEED's Mesh2Splat](https://github.com/electronicarts/mesh2splat):
 fast conversion of textured triangle meshes (`.glb` / `.gltf`) into 3D Gaussian
-Splatting `.ply` files, plus the real-time splat renderer from the original
+Splatting `.ply` (or compressed `.spz`) files, plus the real-time splat renderer from the original
 (PBR relighting, point-light shadows, mesh/splat split-screen, batch conversion).
 
 The original is C++17 + OpenGL 4.6. This port uses **wgpu** (Vulkan / Metal / DX12),
@@ -264,7 +264,7 @@ mesh2splat                       # or: mesh2splat gui path/to/model.glb
 
 The side panel mirrors the original's ImGui windows:
 
-* **Input** — pick or drop a `.glb`, `.gltf` or `.ply` file.
+* **Input** — pick or drop a `.glb`, `.gltf`, `.ply` or `.spz` file.
 * **Output** — choose the output folder, file name and format, then press **Save splat**:
 
 | Format | Bytes / splat | Notes |
@@ -274,8 +274,11 @@ The side panel mirrors the original's ImGui windows:
 | PBR | 76 | Adds metallic / roughness (the original's own layout) |
 | Compressed PBR | 48 | The original's quantised PBR layout |
 | Compressed (PlayCanvas / SuperSplat) | 16 | Chunked quantised layout, ~15x smaller than Standard |
+| SPZ (Niantic) | ≤ 20 | 20 bytes before gzip, which shrinks it further depending on the scene |
 
   The PlayCanvas layout groups splats into chunks of 256 that store the min/max of their positions, log-scales and colours; each splat is then four 32-bit words (position and scale 11/10/11 bits inside the chunk, rotation as smallest-three, 8-bit RGBA). It drops normals and PBR, so it is an export format for viewers rather than a round-trip for relighting. mesh2splat reads it back as well; on DamagedHelmet the round trip is 46 dB PSNR.
+
+  SPZ ([nianticlabs/spz](https://github.com/nianticlabs/spz)) is written as version 3, the last gzip one (readers of version 4 still read it): 24-bit fixed-point positions, 8-bit opacity, colour and log-scale, and a 32-bit smallest-three rotation, stored attribute by attribute so gzip can squeeze them. It also drops normals and PBR. SPZ is defined in RUB axes (y up), the same as glTF, so splats are written as-is and come out upright in SPZ viewers. Tools that convert a 3DGS `.ply` to `.spz` assume the PLY is y-down and flip y and z; the export does not, so a `.spz` shows the other way up from the `.ply` of the same splats. Log scales are clamped to [-10, 6], so the thin axis of a flat splat comes out at e^-10 rather than ~0. `.spz` files (versions 2 and 3) load back in like a `.ply`.
 * **Properties** — visualization mode (Final, Albedo, Depth, Normals, Geometry, Overdraw, PBR), mesh/gaussian depth test, gaussian scale, sampling density (16 up to 1024/2048/4096 px), projection box, **Detail-aware density** and **Merge similar splats** (see below), background color and split-screen.
 * **Lighting** — point light with intensity, color and a cube shadow map, plus the fibre options below.
 * **Camera** — switch between the original fly controls and Maya-style controls, and frame the model.
@@ -331,6 +334,7 @@ mesh2splat convert model.glb --resolution 2048 --format pbr --std 0.65
 # SH0-only standard layout (much smaller, same visual result for converted meshes)
 mesh2splat convert model.glb -o model.ply --format sh0
 mesh2splat convert model.glb -o model.ply --format playcanvas   # ~15x smaller
+mesh2splat convert model.glb --format spz                       # writes model.spz
 
 # sample low-detail triangles on a coarser grid (optional tolerance, default 0.25)
 mesh2splat convert model.glb -o model.ply --detail
@@ -342,7 +346,7 @@ mesh2splat convert model.glb -o model.ply --resolution 1024 --merge 0.5
 # batch (like the original's batch window)
 mesh2splat convert --batch ./meshes -o ./splats --recursive --format compressed
 
-# offscreen render to PNG (mesh inputs are converted first; .ply loaded as-is)
+# offscreen render to PNG (mesh inputs are converted first; .ply / .spz loaded as-is)
 mesh2splat render model.glb -o shot.png --width 1280 --height 720 --orbit 35
 mesh2splat render model.glb -o lit.png --light --light-intensity 20
 mesh2splat render model.glb -o cmp.png --split --mode normal
@@ -381,6 +385,7 @@ ply::write_ply("model.ply", &gaussians.download(&ctx), PlyFormat::Standard, gaus
 src/
   scene.rs          glTF loading (node transforms baked, normals/tangents like the original)
   ply.rs            PLY writers (5 layouts) and reader (standard / PBR / compressed / PlayCanvas)
+  spz.rs            Niantic .spz writer and reader
   camera.rs         fly camera (port of Camera.cpp) + Maya tumble / pan / dolly
   hair.rs           .hair grooms and strand-aligned splats
   merge.rs          optional quadtree merge of alike neighbouring splats (CPU reference)
@@ -471,7 +476,7 @@ They cover the following:
 * Both bounding-box modes and multiple meshes.
 * Rendered pixel values in each mode, and culling.
 * Lighting and shadows.
-* A textured glTF conversion through export and reload in all three PLY layouts.
+* A textured glTF conversion through export and reload in every export format.
 
 The `examples/` folder has small scenes for eyeballing orientation and shadows.
 

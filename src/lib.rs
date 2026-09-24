@@ -12,6 +12,7 @@ pub mod hair;
 pub mod merge;
 pub mod ply;
 pub mod scene;
+pub mod spz;
 pub mod types;
 
 pub use types::*;

@@ -48,8 +48,8 @@ pub enum SourceFormat {
     Ply = 1,
 }
 
-/// PLY export layouts (the original's three, plus SH0-only and the PlayCanvas
-/// compressed layout).
+/// Export layouts: the original's three PLY layouts, plus SH0-only, the
+/// PlayCanvas compressed PLY and Niantic's `.spz`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PlyFormat {
     /// Standard 3DGS layout (positions, normals, f_dc, 45 x f_rest, opacity, scale, rot).
@@ -65,15 +65,19 @@ pub enum PlyFormat {
     /// PlayCanvas / SuperSplat compressed PLY: chunks of 256 splats with
     /// quantised position, rotation, scale and colour (~16 bytes per splat).
     PlayCanvas,
+    /// Niantic `.spz`: quantised per attribute (20 bytes per splat) and
+    /// gzip-compressed. Not a PLY; written with the `.spz` extension.
+    Spz,
 }
 
 impl PlyFormat {
-    pub const ALL: [PlyFormat; 5] = [
+    pub const ALL: [PlyFormat; 6] = [
         PlyFormat::Standard,
         PlyFormat::StandardSh0,
         PlyFormat::Pbr,
         PlyFormat::CompressedPbr,
         PlyFormat::PlayCanvas,
+        PlyFormat::Spz,
     ];
 
     pub fn label(self) -> &'static str {
@@ -83,6 +87,15 @@ impl PlyFormat {
             PlyFormat::Pbr => "PLY PBR",
             PlyFormat::CompressedPbr => "PLY Compressed PBR",
             PlyFormat::PlayCanvas => "PLY Compressed (PlayCanvas / SuperSplat)",
+            PlyFormat::Spz => "SPZ (Niantic, gzip compressed)",
+        }
+    }
+
+    /// File extension (without the dot) for files in this format.
+    pub fn extension(self) -> &'static str {
+        match self {
+            PlyFormat::Spz => "spz",
+            _ => "ply",
         }
     }
 }

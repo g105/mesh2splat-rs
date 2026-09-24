@@ -13,7 +13,7 @@ use crate::types::*;
 // Writing
 // ---------------------------------------------------------------------------
 
-/// Write gaussians to `path`.
+/// Write gaussians to `path` (a `.spz` stream for [`PlyFormat::Spz`]).
 ///
 /// `scale_multiplier` converts stored scales to world-space standard
 /// deviations: `gaussian_std / resolution` for converted meshes, `1.0` for
@@ -33,6 +33,7 @@ pub fn write_ply(
         PlyFormat::Pbr => write_pbr(&mut w, gaussians, scale_multiplier)?,
         PlyFormat::CompressedPbr => write_compressed(&mut w, gaussians, scale_multiplier)?,
         PlyFormat::PlayCanvas => write_playcanvas(&mut w, gaussians, scale_multiplier)?,
+        PlyFormat::Spz => crate::spz::write_spz(&mut w, gaussians, scale_multiplier)?,
     }
     w.flush()?;
     Ok(())
@@ -750,10 +751,18 @@ fn load_playcanvas(d: &PlyVertexData) -> Result<Vec<GaussianVertex>> {
     Ok(out)
 }
 
-/// Load a 3DGS `.ply` (standard, PBR, or compressed-PBR layout).
+/// Load a 3DGS `.ply` (standard, PBR, compressed-PBR or PlayCanvas layout) or
+/// an `.spz`, told apart by content rather than extension.
 /// Scales are exponentiated and opacities passed through a sigmoid, so the
 /// result uses [`SourceFormat::Ply`] semantics.
 pub fn load_gaussian_ply(path: impl AsRef<Path>) -> Result<LoadedPly> {
+    let path = path.as_ref();
+    if crate::spz::is_spz(path)? {
+        return Ok(LoadedPly {
+            gaussians: crate::spz::load_spz(path)?,
+            has_pbr: false,
+        });
+    }
     let d = read_ply_vertices(path)?;
     if d.has("packed_position") {
         return Ok(LoadedPly {

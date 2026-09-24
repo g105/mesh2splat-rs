@@ -106,7 +106,7 @@ fn spawn_load(path: PathBuf, batch: bool, tx: flume::Sender<Loaded>, egui_ctx: e
                     batch,
                 },
             }
-        } else if ext == "ply" {
+        } else if ext == "ply" || ext == "spz" {
             match ply::load_gaussian_ply(&path) {
                 Ok(ply) => Loaded::Ply { path, ply },
                 Err(e) => Loaded::Failed {
@@ -585,11 +585,15 @@ impl App {
     fn output_path(&self) -> PathBuf {
         let mut name = self.output_name.trim().to_string();
         if name.is_empty() {
-            name = "output.ply".into();
+            name = "output".into();
         }
-        if !name.to_ascii_lowercase().ends_with(".ply") {
-            name.push_str(".ply");
+        // The extension follows the chosen format, whatever the name had.
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".ply") || lower.ends_with(".spz") {
+            name.truncate(name.len() - 4);
         }
+        name.push('.');
+        name.push_str(self.format.extension());
         let folder = if self.output_folder.trim().is_empty() {
             self.loaded_path
                 .as_ref()
@@ -705,7 +709,7 @@ impl App {
             Some(e) => BatchStatus::Failed(e),
             None => {
                 let data = self.gaussians.download(&self.ctx);
-                let out = self.batch[i].output.clone();
+                let out = self.batch[i].output.with_extension(self.format.extension());
                 if let Some(p) = out.parent() {
                     let _ = std::fs::create_dir_all(p);
                 }
@@ -732,9 +736,9 @@ impl App {
             ui.add_space(4.0);
 
             egui::CollapsingHeader::new("Input").default_open(true).show(ui, |ui| {
-                if ui.button("Select file to load (.glb / .gltf / .ply / .hair)").clicked() {
+                if ui.button("Select file to load (.glb / .gltf / .ply / .spz / .hair)").clicked() {
                     if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("Mesh, 3DGS or hair groom", &["glb", "gltf", "ply", "hair"])
+                        .add_filter("Mesh, 3DGS or hair groom", &["glb", "gltf", "ply", "spz", "hair"])
                         .pick_file()
                     {
                         self.open(p, &egui_ctx);
@@ -1607,7 +1611,7 @@ impl App {
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Open or drop a .glb / .gltf mesh or a 3DGS .ply",
+                "Open or drop a .glb / .gltf mesh or a 3DGS .ply / .spz",
                 egui::FontId::proportional(20.0),
                 Color32::from_gray(160),
             );

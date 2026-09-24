@@ -31,7 +31,9 @@ pub struct GpuContext {
 
 /// Limits requested from the adapter. The gaussian buffers get big
 /// (96 bytes per splat, up to 7M splats), so ask for the adapter's maximum
-/// buffer sizes instead of the conservative WebGPU defaults.
+/// buffer sizes instead of the conservative WebGPU defaults. Likewise the
+/// G-buffer's bytes per pixel, which the strand tangent takes past the 32
+/// WebGPU guarantees (see `Renderer::new`).
 pub fn required_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
     let a = adapter.limits();
     wgpu::Limits {
@@ -40,6 +42,7 @@ pub fn required_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
         max_storage_buffers_per_shader_stage: a.max_storage_buffers_per_shader_stage.min(16),
         max_compute_workgroups_per_dimension: a.max_compute_workgroups_per_dimension,
         max_texture_dimension_2d: a.max_texture_dimension_2d,
+        max_color_attachment_bytes_per_sample: a.max_color_attachment_bytes_per_sample,
         ..wgpu::Limits::default()
     }
 }

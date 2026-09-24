@@ -19,7 +19,7 @@ struct Lighting {
     forward: u32,            // splats shaded themselves
     transmission: f32,       // how much light comes through the splats
     shadow_density: f32,     // accumulated opacity -> optical depth
-    _p0: u32,
+    tangents: u32,           // 1 = the G-buffer has the strand tangent
     // rgb = colour left after `w` worth of optical depth (Beer-Lambert).
     attenuation: vec4<f32>,
     // x = IOR, y = lengthwise roughness, z = crosswise roughness, w = lobe shift

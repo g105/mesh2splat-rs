@@ -67,7 +67,12 @@ struct GBufferOut {
     @location(0) position: vec4<f32>,
     @location(1) normal: vec4<f32>,
     @location(2) albedo: vec4<f32>,
+    // Metallic, roughness, occlusion.
     @location(3) metal_rough: vec4<f32>,
+    // World-space tangent biased into [0, 1], premultiplied like the normal.
+    // Stored as a vector rather than an angle so overlapping strands average
+    // to the direction they share.
+    @location(4) tangent: vec4<f32>,
 };
 
 @fragment
@@ -90,26 +95,33 @@ fn fs_main(in: VsOut) -> GBufferOut {
     out.position = vec4<f32>(in.ws_pos, 1.0) * g;
     // Premultiply by opacity so rgb / a in the deferred pass is an opacity-weighted
     // average (the original stored the encoded normal un-premultiplied).
-    let n = encode_normal(oct_decode(unpack2x16unorm(in.packed.y)));
-    out.normal = vec4<f32>(n * opacity, opacity) * g;
-    // .z is the tangent angle (see the prepass), averaged like everything else.
-    out.metal_rough = vec4<f32>(unpack4x8unorm(in.packed.z).xyz, 1.0) * g;
+    let n = oct_decode(unpack2x16unorm(in.packed.y));
+    out.normal = vec4<f32>(encode_normal(n) * opacity, opacity) * g;
+    out.metal_rough = vec4<f32>(unpack_metal_rough(in.packed.z), unpack_ao(in.packed.w), 1.0) * g;
+    out.tangent = vec4<f32>((unpack_tangent(n, in.packed.z) * 0.5 + 0.5) * opacity, opacity) * g;
     return out;
 }
+
+// The forward pipeline's only target, in the albedo slot: splats arrive
+// shaded, so the deferred pass just composites them and nothing else of the
+// G-buffer is worth the bandwidth.
+struct ForwardOut {
+    @location(2) color: vec4<f32>,
+};
 
 // Forward shading: same coverage as `fs_main`, but the colour written is the
 // splat's own shaded colour, so the front-to-back blend composites lit strands.
 @fragment
-fn fs_forward(in: VsOut) -> GBufferOut {
+fn fs_forward(in: VsOut) -> ForwardOut {
     let color = unpack4x8unorm(in.packed.x);
     let opacity = color.a;
     let g = exp(-0.5 * dot(in.local, in.local));
     if (g * opacity < 1.0 / 255.0) {
         discard;
     }
-    let mr = unpack4x8unorm(in.packed.z);
+    let mr = unpack_metal_rough(in.packed.z);
     let n = oct_decode(unpack2x16unorm(in.packed.y));
-    let t = decode_tangent(n, mr.z);
+    let t = unpack_tangent(n, in.packed.z);
     let pos = in.ws_pos;
     let v = normalize(lt.cam_pos.xyz - pos);
     let l = normalize(lt.light_pos.xyz - pos);
@@ -138,10 +150,5 @@ fn fs_forward(in: VsOut) -> GBufferOut {
     let ambient = 0.3 * ao * mix(0.6, 1.0, clamp(dot(bent, l) * 0.5 + 0.5, 0.0, 1.0));
     let shaded = tonemap(ambient * albedo + lo);
 
-    var out: GBufferOut;
-    out.albedo = vec4<f32>(shaded * opacity, opacity) * g;
-    out.position = vec4<f32>(pos, 1.0) * g;
-    out.normal = vec4<f32>(encode_normal(n) * opacity, opacity) * g;
-    out.metal_rough = vec4<f32>(mr.xyz, 1.0) * g;
-    return out;
+    return ForwardOut(vec4<f32>(shaded * opacity, opacity) * g);
 }

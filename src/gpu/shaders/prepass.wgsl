@@ -109,21 +109,15 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>, @builtin(num_workgroups)
     q.axes_ndc = vec2<u32>(pack2x16float(p.axes.xy * k), pack2x16float(p.axes.zw * k));
     q.ws_pos = ws.xyz;
     q.extent = pack2x16float(p.extent * k);
-    // Deferred shading has no spare G-buffer channel for occlusion, so fold it
-    // into the colour here rather than per fragment.
-    var out_color = color;
-    if (frame.ao_deferred > 0.0 && g.pbr.z > 0.0) {
-        out_color = vec4<f32>(color.rgb * g.pbr.z, color.a);
-    }
-    q.color = pack4x8unorm(out_color);
+    q.color = pack4x8unorm(color);
     q.normal = pack2x16unorm(oct_encode(normalize(decode_normal(normal_ws.xyz))));
-    // .z carries the tangent as an angle in the plane of the normal.
     let n_unit = normalize(decode_normal(normal_ws.xyz));
     let t_flat = normalize(tangent - n_unit * dot(tangent, n_unit));
-    q.metal_rough = pack4x8unorm(vec4<f32>(g.pbr.xy, encode_tangent(n_unit, t_flat), 0.0));
-    // Baked occlusion (pbr.z) and bent normal (pbr.w); unbaked splats are
-    // fully open and bend along their own normal.
-    if (g.pbr.z > 0.0) {
+    q.metal_rough = pack_material(g.pbr.xy, n_unit, t_flat);
+    // Baked occlusion (pbr.z) and bent normal (pbr.w); unbaked splats, and
+    // every splat when occlusion is off, are fully open and bend along their
+    // own normal.
+    if (frame.use_ao > 0.0 && g.pbr.z > 0.0) {
         let bent = oct_decode(unpack2x16unorm(bitcast<u32>(g.pbr.w)));
         q.ao_bent = pack_ao_bent(bent, g.pbr.z);
     } else {

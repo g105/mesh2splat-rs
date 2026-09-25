@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! cargo run --release --example groom -- assets/straight.hair [--strands 10000]
-//!     [--per-segment 2] [--width W] [--alpha A] [--light] [--forward]
+//!     [--per-segment 2] [--width W] [--width-scale 1] [--roundness 0.05]
+//!     [--clumps N] [--alpha A] [--light] [--forward]
 //!     [--ribbons] [--resolution 2048] [--width-cells 1.5]
 //!     [--bench 60] [--out target/groom]
 //! ```
@@ -144,6 +145,9 @@ struct Args {
     strands: usize,
     per_segment: usize,
     width: Option<f32>,
+    width_scale: f32,
+    roundness: f32,
+    clumps: Option<usize>,
     alpha: f32,
     light: bool,
     forward: bool,
@@ -166,6 +170,9 @@ fn parse_args() -> Result<Args> {
         strands: 10000,
         per_segment: 2,
         width: None,
+        width_scale: 1.0,
+        roundness: 0.05,
+        clumps: None,
         alpha: 0.85,
         light: false,
         forward: false,
@@ -188,6 +195,9 @@ fn parse_args() -> Result<Args> {
             "--strands" => a.strands = val()?.parse()?,
             "--per-segment" | "--direct" => a.per_segment = val()?.parse()?,
             "--width" => a.width = Some(val()?.parse()?),
+            "--width-scale" => a.width_scale = val()?.parse()?,
+            "--roundness" => a.roundness = val()?.parse()?,
+            "--clumps" => a.clumps = Some(val()?.parse()?),
             "--alpha" => a.alpha = val()?.parse()?,
             "--light" => a.light = true,
             "--forward" => a.forward = true,
@@ -218,6 +228,28 @@ fn main() -> Result<()> {
     let groom = Groom::load(&args.file)?
         .subsampled(args.strands)
         .normalized(2.0);
+    // One wide strand per clump of strands that travel together.
+    let groom = match args.clumps {
+        Some(clumps) => {
+            let t = std::time::Instant::now();
+            let c = groom.clumped(&mesh2splat::clump::ClumpSettings {
+                clumps,
+                ..Default::default()
+            });
+            let mut members = c.members.clone();
+            members.sort_unstable();
+            println!(
+                "{} strands -> {} clumps in {:.0} ms (members: median {}, largest {})",
+                groom.strands.len(),
+                c.groom.strands.len(),
+                t.elapsed().as_secs_f64() * 1e3,
+                members[members.len() / 2],
+                members.last().unwrap()
+            );
+            c.groom
+        }
+        None => groom,
+    };
     let bbox = groom.bbox();
     let cell = bbox.size().max_element() / args.resolution as f32;
     let width = args.width.unwrap_or(if args.ribbons {
@@ -276,8 +308,12 @@ fn main() -> Result<()> {
             );
         }
     } else {
+        // Each point's own width from the file, unless overridden: clumps
+        // are as wide as their members spread, and strands taper.
         let splats = groom.splats(&StrandSplats {
-            width: Some(width),
+            width: args.width,
+            width_scale: args.width_scale,
+            roundness: args.roundness,
             per_segment: args.per_segment,
             alpha: args.alpha,
         });

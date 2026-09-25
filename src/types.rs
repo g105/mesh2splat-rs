@@ -19,7 +19,10 @@ pub const DEFAULT_ROUGHNESS: f32 = 0.5;
 /// `GaussianVertex` SSBO struct (6 x vec4 = 96 bytes).
 ///
 /// * `position.xyz` – model-space mean
-/// * `color`        – RGBA (gamma space), alpha = opacity
+/// * `color`        – RGBA (gamma space), alpha = opacity. Opacity above 1
+///   means optically denser than one opaque layer, as a clump of many strands
+///   is: it draws as opaque, while the shadow and occlusion passes, which add
+///   up the light splats stop, see all of it. Exports clamp it to 1.
 /// * `scale.xyz`    – per-axis standard deviation. For freshly converted meshes
 ///   this is *unscaled* (multiply by `gaussian_std / resolution`), for loaded
 ///   PLY files it is the real (exp'ed) scale.

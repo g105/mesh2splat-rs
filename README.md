@@ -129,7 +129,45 @@ them as surfaces reads as felt. Three settings (all off by default) target that:
   unpooled groom, where deferred shading scores 40 / 36 dB against it.
 
 Strand width and opacity come from the per-point values in the `.hair` file, so
-strands taper and see-through tips stay soft.
+strands taper and see-through tips stay soft. **Width ×** scales them without
+losing the taper, and has no upper limit: the renderer takes a splat's longest
+axis for the strand's direction, so a strand wider than its segments are long
+is drawn through fewer of its points, each splat staying longer than wide.
+**Roundness** sets the cross-section, from a flat ribbon (which vanishes edge
+on) towards a round tube (which keeps a wide strand's volume from every side).
+
+### Clumps: stylised, low-resolution grooms
+
+**Clump strands** groups strands that travel together and draws each group as
+one strand, as wide at each point as its members are spread there, for the
+few-hundred-clump look of feature animation and hair cards. Strands are
+compared as whole curves (resampled by arc length, k-means on those), so two
+strands clump when they start close *and* go the same way. Each clump becomes
+its members' mean curve.
+
+A clump stops as much light as its members did together, which for a clump of
+a hundred strands is several opaque layers. A splat's opacity may exceed 1 for
+that reason: it still draws as opaque, while self-shadowing and baked
+occlusion see all of it. Capped at 1, a clumped groom shadowed itself too
+little and came out brighter and glossier the fewer its clumps. The occlusion
+bake also starts each ray three standard deviations out along it, so a wide
+clump no longer counts its own mass as occlusion. That changes nothing for
+ordinary strands, which are far thinner than a grid cell.
+
+The curly groom at its full 50 k strands (6.5 M splats), against itself, at
+roundness 0.6 (PSNR front / side / close):
+
+| clumps | splats | PSNR |
+|---|---|---|
+| 2000 | 56 k (117x fewer) | 34.8 / 30.2 / 30.6 dB |
+| 500 | 8.7 k (740x fewer) | 34.2 / 33.0 / 30.3 dB |
+| 200 | 2.7 k (2400x fewer) | 34.5 / 33.4 / 30.2 dB |
+
+Silhouette, volume and shading hold down to 200 clumps; the fine flyaways do
+not, and should not. Round cross-sections score 4-6 dB above flat ribbons.
+Clumps at their measured width fill the volume and blend into each other; a
+**Width ×** below 1 separates them into distinct clumps, a more stylised look.
+Finding 200-5000 clumps in 50 k strands takes about half a second.
 
 Open a `.hair` groom in the viewer like any other file (**Input**, or drag and
 drop). It loads as strand-aligned splats, turns on hair shading and opacity

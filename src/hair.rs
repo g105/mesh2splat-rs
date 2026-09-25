@@ -43,6 +43,16 @@ pub struct Groom {
 pub struct StrandSplats {
     /// Splat width; `None` uses each point's own thickness from the file.
     pub width: Option<f32>,
+    /// Multiplies the width, whichever it comes from, so a widened strand
+    /// keeps its taper. There is no upper limit: a strand wider than its
+    /// segments are long is drawn with fewer, longer splats (see
+    /// [`MIN_ELONGATION`]).
+    pub width_scale: f32,
+    /// Thickness of the splats' cross-section as a fraction of their width:
+    /// near 0 a flat ribbon, which vanishes edge on; towards 1 a round tube,
+    /// which keeps a wide strand's volume from every side. Capped below 1 so
+    /// the flat side, and with it the normal, stays defined.
+    pub roundness: f32,
     /// Splats per strand segment. More gives smoother curls.
     pub per_segment: usize,
     /// Multiplies each point's own opacity from the file.
@@ -53,11 +63,23 @@ impl Default for StrandSplats {
     fn default() -> Self {
         Self {
             width: None,
+            width_scale: 1.0,
+            roundness: 0.05,
             per_segment: 2,
             alpha: 0.85,
         }
     }
 }
+
+/// How much longer than wide a strand splat must stay. The renderer and the
+/// pooler take a splat's longest axis for the strand's direction: a splat
+/// wider than long would turn its highlight, and its pooling, across the
+/// strand.
+pub const MIN_ELONGATION: f32 = 1.25;
+
+/// Most roundness a strand splat may have: at 1 its two short axes tie and
+/// its normal is arbitrary.
+pub const MAX_ROUNDNESS: f32 = 0.9;
 
 fn f32_at(b: &[u8], off: usize) -> f32 {
     f32::from_le_bytes(b[off..off + 4].try_into().unwrap())
@@ -222,12 +244,23 @@ impl Groom {
     /// semantics: the scales are final world standard deviations.
     pub fn splats(&self, cfg: &StrandSplats) -> Vec<GaussianVertex> {
         let center = self.bbox().center();
-        let k = cfg.per_segment.max(1);
-        let mut out = Vec::with_capacity(self.segment_count() * k);
+        let per_segment = cfg.per_segment.max(1);
+        let roundness = cfg.roundness.clamp(0.0, MAX_ROUNDNESS);
+        let mut out = Vec::with_capacity(self.segment_count() * per_segment);
         for s in &self.strands {
-            for i in 0..s.points.len().saturating_sub(1) {
-                let (p0, p1) = (s.points[i], s.points[i + 1]);
-                let (c0, c1) = (s.colors[i], s.colors[i + 1]);
+            let width_at = |i: usize| {
+                cfg.width.unwrap_or_else(|| s.thickness.get(i).copied().unwrap_or(self.thickness))
+                    * cfg.width_scale
+            };
+            let kept = keep_points(&s.points, width_at);
+            for w in kept.windows(2) {
+                let (i, i1) = (w[0], w[1]);
+                let (p0, p1) = (s.points[i], s.points[i1]);
+                let (c0, c1) = (s.colors[i], s.colors[i1]);
+                // As many splats as fit while each stays longer than wide.
+                let most = (p1 - p0).length()
+                    / (MIN_ELONGATION * width_at(i).max(width_at(i1)).max(1e-12));
+                let k = per_segment.min(most as usize).max(1);
                 for j in 0..k {
                     let (t0, t1) = (j as f32 / k as f32, (j + 1) as f32 / k as f32);
                     let (a, b) = (p0.lerp(p1, t0), p0.lerp(p1, t1));
@@ -250,25 +283,22 @@ impl Groom {
                     let color = c0.lerp(c1, mid_t).clamp(Vec3::ZERO, Vec3::ONE);
                     // Width and opacity taper along the strand unless overridden.
                     let lerp = |a: f32, b: f32| a + (b - a) * mid_t;
-                    let width = cfg.width.unwrap_or_else(|| {
-                        lerp(
-                            s.thickness.get(i).copied().unwrap_or(self.thickness),
-                            s.thickness.get(i + 1).copied().unwrap_or(self.thickness),
-                        )
-                    });
+                    let width = lerp(width_at(i), width_at(i1));
                     let alpha = cfg.alpha
                         * lerp(
                             s.alpha.get(i).copied().unwrap_or(1.0),
-                            s.alpha.get(i + 1).copied().unwrap_or(1.0),
+                            s.alpha.get(i1).copied().unwrap_or(1.0),
                         );
                     out.push(GaussianVertex {
                         position: mid.extend(1.0).to_array(),
-                        color: color.extend(alpha.clamp(0.0, 1.0)).to_array(),
+                        // Not capped at 1: a clump's opacity carries how many
+                        // strands' worth of light it stops.
+                        color: color.extend(alpha.max(0.0)).to_array(),
                         // Half-length: neighbouring splats overlap.
                         scale: [
                             (b - a).length() * 0.5,
                             width * 0.5,
-                            (width * 0.05).max(1e-6),
+                            (width * 0.5 * roundness).max(1e-6),
                             0.0,
                         ],
                         normal: normal.extend(0.0).to_array(),
@@ -280,6 +310,33 @@ impl Groom {
         }
         out
     }
+}
+
+/// The points of a strand to draw it through: all of them, unless it is so
+/// wide that splats spanning its segments would come out wider than long.
+/// Then points are skipped until the chord is long enough. Detail finer than
+/// the strand is wide cannot show anyway.
+fn keep_points(points: &[Vec3], width_at: impl Fn(usize) -> f32) -> Vec<usize> {
+    let n = points.len();
+    if n < 2 {
+        return (0..n).collect();
+    }
+    let long_enough = |a: usize, b: usize| {
+        (points[b] - points[a]).length() >= MIN_ELONGATION * width_at(a).max(width_at(b))
+    };
+    let mut kept = vec![0];
+    for i in 1..n - 1 {
+        if long_enough(*kept.last().unwrap(), i) {
+            kept.push(i);
+        }
+    }
+    // The tip always stays; if the last stretch to it is too short, it
+    // replaces the point before rather than leaving a stub.
+    if kept.len() > 1 && !long_enough(*kept.last().unwrap(), n - 1) {
+        kept.pop();
+    }
+    kept.push(n - 1);
+    kept
 }
 
 #[cfg(test)]
@@ -340,6 +397,49 @@ mod tests {
             ..Default::default()
         });
         assert!(fixed.iter().all(|s| (width(s) - 0.025).abs() < 1e-6));
+    }
+
+    #[test]
+    fn widening_keeps_the_taper_and_the_strand_direction() {
+        let g = straight_groom(1, 8);
+        let width = |s: &GaussianVertex| s.scale[1];
+        let base = g.splats(&StrandSplats::default());
+        // Wide enough that the original segments are far shorter than wide.
+        let wide = g.splats(&StrandSplats {
+            width_scale: 10.0,
+            ..Default::default()
+        });
+        assert!(wide.len() > 1 && wide.len() < base.len(), "fewer, longer splats");
+        // 10 times the file's width wherever the splat sits: this strand
+        // tapers linearly from 0.1 at the root to 0.05 at the tip, y = 4.
+        for s in &wide {
+            let file = 0.1 * (1.0 - 0.5 * s.position[1] / 4.0);
+            assert!((width(s) - 10.0 * file * 0.5).abs() < 1e-4, "{} vs {}", width(s), file);
+        }
+        assert!(width(wide.first().unwrap()) > width(wide.last().unwrap()));
+        for s in &wide {
+            assert!(s.scale[0] > s.scale[1] && s.scale[1] > s.scale[2], "{:?}", s.scale);
+        }
+        // The strand is still covered root to tip.
+        let ys: Vec<f32> = wide.iter().map(|s| s.position[1]).collect();
+        let span = ys.last().unwrap() - ys.first().unwrap() + wide.last().unwrap().scale[0] * 2.0;
+        assert!(span > 3.0, "{span}");
+    }
+
+    #[test]
+    fn roundness_thickens_the_cross_section() {
+        let g = straight_groom(1, 4);
+        let round = g.splats(&StrandSplats {
+            roundness: 0.8,
+            ..Default::default()
+        });
+        assert!((round[0].scale[2] / round[0].scale[1] - 0.8).abs() < 1e-5);
+        // Never a tie between the short axes, which would lose the normal.
+        let over = g.splats(&StrandSplats {
+            roundness: 5.0,
+            ..Default::default()
+        });
+        assert!(over[0].scale[2] < over[0].scale[1]);
     }
 
     #[test]

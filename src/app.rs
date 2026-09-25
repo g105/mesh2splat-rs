@@ -32,7 +32,9 @@ use crate::types::{BBox, PlyFormat, RenderMode, SourceFormat};
 pub fn run(file: Option<PathBuf>) -> Result<()> {
     let mut create = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     // Compute + storage-in-fragment needs a "real" backend (Vulkan / Metal / DX12).
-    create.instance_descriptor.backends = wgpu::Backends::PRIMARY;
+    // `WGPU_BACKEND` (e.g. `dx12`, `vulkan`) overrides the choice, as it already
+    // does for the CLI: on Windows wgpu otherwise tends to pick Vulkan.
+    create.instance_descriptor.backends = wgpu::Backends::PRIMARY.with_env();
     create.power_preference = wgpu::PowerPreference::HighPerformance;
     create.device_descriptor = Arc::new(crate::gpu::device_descriptor);
 

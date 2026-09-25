@@ -251,6 +251,12 @@ cargo build --release                         # GUI + CLI
 cargo build --release --no-default-features   # CLI only (no windowing deps)
 ```
 
+To force a graphics backend, set `WGPU_BACKEND` to `dx12`, `vulkan` or
+`metal` (the GUI and the CLI both honour it). On Windows wgpu usually picks
+Vulkan; if the viewer freezes or misbehaves there, try
+`set WGPU_BACKEND=dx12` (cmd) or `$env:WGPU_BACKEND="dx12"` (PowerShell).
+The **Stats** section shows the backend in use.
+
 On Linux, the file dialogs go through the XDG desktop portal. If no portal is
 running, type or paste paths into the text boxes, or drag and drop files.
 

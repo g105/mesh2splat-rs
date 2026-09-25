@@ -24,7 +24,8 @@ use crate::gpu::{
     BBoxMode, ConvertSettings, Converter, GaussianBuffer, GpuContext, GpuScene, RenderSettings,
     Renderer,
 };
-use crate::hair::{Groom, StrandSplats};
+use crate::clump::ClumpSettings;
+use crate::hair::{Groom, StrandSplats, MAX_ROUNDNESS};
 use crate::ply::{self, LoadedPly};
 use crate::scene::{self, Scene};
 use crate::types::{BBox, PlyFormat, RenderMode, SourceFormat};
@@ -229,6 +230,13 @@ struct Status {
     at: Instant,
 }
 
+/// A clumped groom and what it was clumped from.
+struct ClumpCache {
+    key: (usize, usize),
+    median_members: u32,
+    groom: Box<Groom>,
+}
+
 pub struct App {
     ctx: GpuContext,
     renderer: Renderer,
@@ -256,6 +264,11 @@ pub struct App {
     groom: Option<Box<Groom>>,
     groom_strands: usize,
     groom_splats: StrandSplats,
+    /// Clumps to reduce the strands to, if any.
+    groom_clumps: Option<usize>,
+    /// The last clumping, keyed by (strands, clumps): finding clumps is the
+    /// slow part, so width and opacity changes reuse it.
+    groom_clumped: Option<ClumpCache>,
     merge_enabled: bool,
     merge_strength: f32,
     detail_enabled: bool,
@@ -358,6 +371,8 @@ impl App {
             groom: None,
             groom_strands: 20000,
             groom_splats: StrandSplats::default(),
+            groom_clumps: None,
+            groom_clumped: None,
             merge_enabled: false,
             merge_strength: MergeSettings::DEFAULT_STRENGTH,
             detail_enabled: false,
@@ -424,7 +439,26 @@ impl App {
             return;
         };
         let sub = groom.subsampled(self.groom_strands);
-        let splats = sub.splats(&self.groom_splats);
+        let splats = match self.groom_clumps {
+            Some(clumps) => {
+                let key = (self.groom_strands, clumps);
+                if self.groom_clumped.as_ref().is_none_or(|c| c.key != key) {
+                    let c = sub.clumped(&ClumpSettings {
+                        clumps,
+                        ..Default::default()
+                    });
+                    let mut members = c.members;
+                    members.sort_unstable();
+                    self.groom_clumped = Some(ClumpCache {
+                        key,
+                        median_members: members.get(members.len() / 2).copied().unwrap_or(0),
+                        groom: Box::new(c.groom),
+                    });
+                }
+                self.groom_clumped.as_ref().unwrap().groom.splats(&self.groom_splats)
+            }
+            None => sub.splats(&self.groom_splats),
+        };
         let mut bbox = BBox::EMPTY;
         for g in &splats {
             bbox.grow(Vec3::from_slice(&g.position[..3]));
@@ -512,6 +546,7 @@ impl App {
                     let segments = groom.segment_count();
                     self.groom_strands = self.groom_strands.min(strands);
                     self.groom = Some(groom);
+                    self.groom_clumped = None;
                     self.rebuild_groom();
                     // Strand splats are long and thin: shade them as fibres.
                     self.settings.hair_shading = true;
@@ -1094,19 +1129,48 @@ impl App {
             ui,
             egui::Slider::new(&mut self.groom_splats.per_segment, 1..=6).text("Splats per segment"),
         );
-        let mut width = self.groom_splats.width.unwrap_or(thickness);
+        let mut clump = self.groom_clumps.is_some();
+        let r = ui.checkbox(&mut clump, "Clump strands").on_hover_text(
+            "Group strands that travel together and draw each group as one wide strand, as wide at each point as its strands are spread: a stylised, low-resolution groom with the volume of the full one.",
+        );
+        let toggled = r.changed();
+        if toggled {
+            self.groom_clumps = clump.then_some(self.groom_strands.min(500).max(1));
+        }
+        if let Some(clumps) = &mut self.groom_clumps {
+            let most = self.groom_strands.max(10);
+            slider(
+                ui,
+                egui::Slider::new(clumps, 10.min(most)..=most).logarithmic(true).text("Clumps"),
+            );
+            if let Some(c) = &self.groom_clumped {
+                ui.small(format!(
+                    "{} clumps, a median of {} strands each",
+                    fmt_thousands(c.groom.strands.len() as u64),
+                    c.median_members
+                ));
+            }
+        }
+        // A multiplier rather than a width, so strands keep the taper the file
+        // gives them, and clumps the width their spread gives them.
+        self.groom_splats.width = None;
         slider(
             ui,
-            egui::Slider::new(&mut width, thickness * 0.1..=thickness * 4.0)
+            egui::Slider::new(&mut self.groom_splats.width_scale, 0.1..=100.0)
                 .logarithmic(true)
-                .text("Strand width"),
+                .text("Width ×"),
+        )
+        ;
+        ui.small(format!("strands in the file are {:.4} wide", thickness));
+        slider(
+            ui,
+            egui::Slider::new(&mut self.groom_splats.roundness, 0.0..=MAX_ROUNDNESS).text("Roundness"),
         );
-        self.groom_splats.width = Some(width);
         slider(
             ui,
             egui::Slider::new(&mut self.groom_splats.alpha, 0.05..=1.0).text("Strand opacity"),
         );
-        if changed {
+        if changed || toggled {
             self.rebuild_groom();
         }
         if !self.settings.lighting {

@@ -8,12 +8,13 @@
 // so shading gets them for free afterwards.
 
 struct AoParams {
-    /// Grid origin and cell size.
+    /// Grid origin; cell size, w = what turns stored scales into world ones.
     bbox_min: vec4<f32>,
     cell: vec4<f32>,
     /// x = grid side, y = splat count, z = ray steps, w = directions
     dims: vec4<u32>,
-    /// x = density scale, y = occlusion strength, z = step length in cells
+    /// x = density scale, y = occlusion strength, z = step length in cells,
+    /// w = where rays leave a splat, in its standard deviations
     tune: vec4<f32>,
 };
 
@@ -125,14 +126,22 @@ fn bake(@builtin(global_invocation_id) gid3: vec3<u32>, @builtin(num_workgroups)
     let dirs = P.dims.w;
     let step = P.cell.x * P.tune.z;
 
+    // The splat's own axes, to find how far it reaches along each ray.
+    let rot = cast_quat_to_mat3(g.rotation / max(length(g.rotation), 1e-20));
+    let axes = mat3x3<f32>(splat_axis(rot, 0u), splat_axis(rot, 1u), splat_axis(rot, 2u));
+    let inv_scale = 1.0 / max(g.scale.xyz * P.cell.w, vec3<f32>(1e-12));
+
     var open = 0.0;
     var bent = vec3<f32>(0.0);
     for (var d = 0u; d < dirs; d++) {
         let dir = ray_direction(d, dirs);
         var optical = 0.0;
-        // Start a cell out, or the splat occludes itself.
-        for (var s = 1u; s <= steps; s++) {
-            optical += density_at(origin + dir * (step * f32(s))) * step;
+        // Start clear of the splat, or it occludes itself: a step out, or past
+        // its own extent along this ray if it reaches further, as a clump does.
+        let reach = P.tune.w / max(length((dir * axes) * inv_scale), 1e-12);
+        let start = max(step, reach);
+        for (var s = 0u; s < steps; s++) {
+            optical += density_at(origin + dir * (start + step * f32(s))) * step;
         }
         let t = exp(-P.tune.y * optical);
         open += t;

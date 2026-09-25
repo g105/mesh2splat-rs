@@ -10,6 +10,7 @@
 use bytemuck::{Pod, Zeroable};
 
 use super::{compute_pipeline, dispatch_dims, storage_entry, uniform_entry, GaussianBuffer, GpuContext};
+use super::renderer::RenderSettings;
 use crate::types::BBox;
 
 #[repr(C)]
@@ -36,6 +37,11 @@ pub struct AoSettings {
     /// holds splat area over cell volume, which is the extinction coefficient,
     /// so 1 is the physical value; lower it for a softer result.
     pub density: f32,
+    /// Where rays leave a splat, in its own standard deviations along each
+    /// ray. A strand is far thinner than a grid cell, so its rays start a
+    /// step out whatever this is; a clump is wider, and rays starting inside
+    /// it would count its own mass as occlusion.
+    pub self_extent: f32,
 }
 
 impl Default for AoSettings {
@@ -46,6 +52,7 @@ impl Default for AoSettings {
             steps: 12,
             step_cells: 1.5,
             density: 1.0,
+            self_extent: 3.0,
         }
     }
 }
@@ -119,9 +126,12 @@ impl AoBaker {
         let cell = size / grid as f32;
         let params = Params {
             bbox_min: min.extend(0.0).to_array(),
-            cell: cell.extend(0.0).to_array(),
+            // Converted splats store their scale in grid units.
+            cell: cell
+                .extend(gaussians.scale_multiplier(RenderSettings::default().gaussian_std))
+                .to_array(),
             dims: [grid, gaussians.count, cfg.steps, cfg.directions.max(1)],
-            tune: [1.0, cfg.density, cfg.step_cells, 0.0],
+            tune: [1.0, cfg.density, cfg.step_cells, cfg.self_extent],
         };
         ctx.queue
             .write_buffer(&self.params, 0, bytemuck::bytes_of(&params));

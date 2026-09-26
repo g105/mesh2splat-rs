@@ -325,6 +325,60 @@ struct ClumpCache {
     groom: Box<Groom>,
 }
 
+/// Splats rebuilt from the groom on a worker thread.
+struct GroomBuilt {
+    gaussians: GaussianBuffer,
+    bbox: BBox,
+    clumped: Option<Arc<ClumpCache>>,
+}
+
+/// Build the splats for `groom` (subsampled to `strands`, clumped to `clumps`
+/// if given). `cache` is reused when it matches, so width and opacity changes
+/// skip the clumping.
+fn build_groom(
+    ctx: &GpuContext,
+    groom: &Groom,
+    strands: usize,
+    clumps: Option<usize>,
+    cfg: &StrandSplats,
+    cache: Option<Arc<ClumpCache>>,
+) -> GroomBuilt {
+    let (splats, clumped) = match clumps {
+        Some(clumps) => {
+            let key = (strands, clumps);
+            let cache = match cache.filter(|c| c.key == key) {
+                Some(c) => c,
+                None => {
+                    let c = groom.subsampled(strands).clumped(&ClumpSettings {
+                        clumps,
+                        ..Default::default()
+                    });
+                    let mut members = c.members;
+                    members.sort_unstable();
+                    Arc::new(ClumpCache {
+                        key,
+                        median_members: members.get(members.len() / 2).copied().unwrap_or(0),
+                        groom: Box::new(c.groom),
+                    })
+                }
+            };
+            (cache.groom.splats(cfg), Some(cache))
+        }
+        None => (groom.subsampled(strands).splats(cfg), cache),
+    };
+    let mut bbox = BBox::EMPTY;
+    for g in &splats {
+        bbox.grow(Vec3::from_slice(&g.position[..3]));
+    }
+    let mut gaussians = GaussianBuffer::new_empty(ctx);
+    gaussians.upload_ply(ctx, &splats, false);
+    GroomBuilt {
+        gaussians,
+        bbox,
+        clumped,
+    }
+}
+
 pub struct App {
     ctx: GpuContext,
     renderer: Renderer,
@@ -354,14 +408,19 @@ pub struct App {
     volume_merge: VolumeMergeSettings,
     pooler: Option<GpuPooler>,
     /// Loaded hair groom, kept so the strand settings can rebuild its splats.
-    groom: Option<Box<Groom>>,
+    groom: Option<Arc<Groom>>,
     groom_strands: usize,
     groom_splats: StrandSplats,
     /// Clumps to reduce the strands to, if any.
     groom_clumps: Option<usize>,
     /// The last clumping, keyed by (strands, clumps): finding clumps is the
     /// slow part, so width and opacity changes reuse it.
-    groom_clumped: Option<ClumpCache>,
+    groom_clumped: Option<Arc<ClumpCache>>,
+    /// A groom setting changed since the last rebuild was started.
+    groom_dirty: bool,
+    /// The rebuild running on a worker thread. Only the latest settings matter,
+    /// so changes made meanwhile start one more rebuild when it finishes.
+    groom_build: Option<flume::Receiver<GroomBuilt>>,
     merge_enabled: bool,
     merge_strength: f32,
     detail_enabled: bool,
@@ -481,6 +540,8 @@ impl App {
             groom_splats: StrandSplats::default(),
             groom_clumps: None,
             groom_clumped: None,
+            groom_dirty: false,
+            groom_build: None,
             merge_enabled: false,
             merge_strength: MergeSettings::DEFAULT_STRENGTH,
             detail_enabled: false,
@@ -704,37 +765,57 @@ impl App {
     }
 
     /// Rebuild the strand splats after a groom setting changed.
-    fn rebuild_groom(&mut self) {
-        let Some(groom) = &self.groom else {
+    /// Start rebuilding the strand splats if a groom setting changed and no
+    /// rebuild is running.
+    fn start_groom_build(&mut self, egui_ctx: &egui::Context) {
+        if !self.groom_dirty || self.groom_build.is_some() {
+            return;
+        }
+        self.groom_dirty = false;
+        let Some(groom) = self.groom.clone() else {
             return;
         };
-        let sub = groom.subsampled(self.groom_strands);
-        let splats = match self.groom_clumps {
-            Some(clumps) => {
-                let key = (self.groom_strands, clumps);
-                if self.groom_clumped.as_ref().is_none_or(|c| c.key != key) {
-                    let c = sub.clumped(&ClumpSettings {
-                        clumps,
-                        ..Default::default()
-                    });
-                    let mut members = c.members;
-                    members.sort_unstable();
-                    self.groom_clumped = Some(ClumpCache {
-                        key,
-                        median_members: members.get(members.len() / 2).copied().unwrap_or(0),
-                        groom: Box::new(c.groom),
-                    });
-                }
-                self.groom_clumped.as_ref().unwrap().groom.splats(&self.groom_splats)
-            }
-            None => sub.splats(&self.groom_splats),
+        let (strands, clumps, cfg) = (self.groom_strands, self.groom_clumps, self.groom_splats);
+        let cache = self.groom_clumped.clone();
+        let ctx = self.ctx.clone();
+        let egui_ctx = egui_ctx.clone();
+        let (tx, rx) = flume::bounded(1);
+        std::thread::Builder::new()
+            .name("groom rebuild".into())
+            .spawn(move || {
+                let _ = tx.send(build_groom(&ctx, &groom, strands, clumps, &cfg, cache));
+                egui_ctx.request_repaint();
+            })
+            .expect("cannot spawn a worker thread");
+        self.groom_build = Some(rx);
+    }
+
+    /// Show a finished groom rebuild, if any.
+    fn poll_groom_build(&mut self) {
+        let Some(rx) = &self.groom_build else {
+            return;
         };
-        let mut bbox = BBox::EMPTY;
-        for g in &splats {
-            bbox.grow(Vec3::from_slice(&g.position[..3]));
+        match rx.try_recv() {
+            Ok(built) => {
+                self.groom_build = None;
+                let mut gaussians = built.gaussians;
+                gaussians.generation = self.gaussians.generation + 1;
+                self.gaussians = gaussians;
+                self.scene_bbox = built.bbox;
+                self.groom_clumped = built.clumped;
+            }
+            Err(flume::TryRecvError::Empty) => {}
+            Err(flume::TryRecvError::Disconnected) => {
+                self.groom_build = None;
+                self.set_status("Rebuilding the groom failed (see the log)", true);
+            }
         }
-        self.scene_bbox = bbox;
-        self.gaussians.upload_ply(&self.ctx, &splats, false);
+    }
+
+    /// Drop a groom rebuild in flight: other splats are being loaded.
+    fn cancel_groom_build(&mut self) {
+        self.groom_build = None;
+        self.groom_dirty = false;
     }
 
     fn resolution(&self) -> u32 {
@@ -792,6 +873,7 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Loaded::Mesh { path, scene, batch } => {
+                    self.cancel_groom_build();
                     self.scene_bbox = scene.bbox;
                     self.scene = Some(scene);
                     self.settings.model_transform = Mat4::IDENTITY;
@@ -827,9 +909,13 @@ impl App {
                     let strands = groom.strands.len();
                     let segments = groom.segment_count();
                     self.groom_strands = self.groom_strands.min(strands);
-                    self.groom = Some(groom);
+                    // Frame the groom now; its splats follow from the worker.
+                    self.scene_bbox = groom.bbox();
+                    self.groom = Some(Arc::from(groom));
                     self.groom_clumped = None;
-                    self.rebuild_groom();
+                    // Discard a rebuild of the previous groom, then build this one.
+                    self.groom_build = None;
+                    self.groom_dirty = true;
                     // Strand splats are long and thin: shade them as fibres.
                     self.settings.hair_shading = true;
                     self.settings.opacity_shadows = true;
@@ -854,6 +940,7 @@ impl App {
                     mut gaussians,
                     has_pbr,
                 } => {
+                    self.cancel_groom_build();
                     self.loading = None;
                     self.scene = None;
                     self.pending_conversion = None;
@@ -1419,7 +1506,13 @@ impl App {
             egui::Slider::new(&mut self.groom_splats.alpha, 0.05..=1.0).text("Strand opacity"),
         );
         if changed || toggled {
-            self.rebuild_groom();
+            self.groom_dirty = true;
+        }
+        if self.groom_build.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Rebuilding splats");
+            });
         }
         if !self.settings.lighting {
             ui.small("Enable lighting to see the anisotropic hair shading.");
@@ -1946,7 +2039,9 @@ impl App {
             || self.batch_running
             || self.needs_conversion
             || self.job.is_some()
-            || self.pending_conversion.is_some();
+            || self.pending_conversion.is_some()
+            || self.groom_build.is_some()
+            || self.groom_dirty;
         if self.continuous_redraw || busy || fly_keys_held || self.settle_frames > 0 {
             self.settle_frames = self.settle_frames.saturating_sub(1);
             ctx.request_repaint();
@@ -2024,6 +2119,7 @@ impl eframe::App for App {
         let egui_ctx = ui.ctx().clone();
         self.exit_if_device_lost();
         self.poll_job();
+        self.poll_groom_build();
         self.handle_loaded();
         self.pump_batch(&egui_ctx);
         if self.job.is_none() {
@@ -2058,6 +2154,8 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show_inside(ui, |ui| self.viewport(ui, frame));
+        // After the panels, so a groom setting changed this frame starts now.
+        self.start_groom_build(&egui_ctx);
         self.schedule_repaint(&egui_ctx);
         // The frame just submitted may have lost the device: quit before egui
         // paints with it.

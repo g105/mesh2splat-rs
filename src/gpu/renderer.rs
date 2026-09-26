@@ -158,6 +158,9 @@ const TS_PREPASS_END: u32 = 3;
 const TS_SPLAT_BEGIN: u32 = 4;
 const TS_SPLAT_END: u32 = 5;
 const TS_COUNT: u32 = 6;
+/// `resolve_query_set` destinations must be 256-byte aligned, and each slot
+/// is resolved on its own (only the ones written this frame).
+const TS_RESOLVE_STRIDE: u64 = wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT;
 
 // --- uniforms --------------------------------------------------------------
 
@@ -1012,7 +1015,7 @@ impl Renderer {
                 })),
                 Some(device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("timestamp resolve"),
-                    size: TS_COUNT as u64 * 8,
+                    size: TS_COUNT as u64 * TS_RESOLVE_STRIDE,
                     usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
                     mapped_at_creation: false,
                 })),
@@ -1591,17 +1594,21 @@ impl Renderer {
         }
 
         // --- 5. splats -> G-buffer
+        let mut splat_begin_slot = TS_FRAME_BEGIN;
         {
             // The splat pass is never first when the prepass ran, so its begin
             // slot only doubles as the frame begin for empty frames.
-            let ts = qs.map(|q| wgpu::RenderPassTimestampWrites {
-                query_set: q,
-                beginning_of_pass_write_index: Some(if begin_ts() {
+            let ts = qs.map(|q| {
+                splat_begin_slot = if begin_ts() {
                     TS_FRAME_BEGIN
                 } else {
                     TS_SPLAT_BEGIN
-                }),
-                end_of_pass_write_index: Some(TS_SPLAT_END),
+                };
+                wgpu::RenderPassTimestampWrites {
+                    query_set: q,
+                    beginning_of_pass_write_index: Some(splat_begin_slot),
+                    end_of_pass_write_index: Some(TS_SPLAT_END),
+                }
             });
             let atts = if forward {
                 t.splat.forward_attachments()
@@ -1663,8 +1670,26 @@ impl Renderer {
         // --- stats readback (non-blocking)
         if stats_copy {
             if let (Some(q), Some(resolve)) = (&self.stats.query_set, &self.stats.resolve) {
-                enc.resolve_query_set(q, 0..TS_COUNT, resolve, 0);
-                enc.copy_buffer_to_buffer(resolve, 0, &self.stats.buffer, 0, TS_COUNT as u64 * 8);
+                // Resolve only the slots this frame wrote. Vulkan resolves wait
+                // for each query to become available, and one that was never
+                // written never does: the GPU hangs until the driver resets it
+                // (a lost device on Windows). The readback only reads slots it
+                // knows were written, from `prepass_begin_slot`.
+                let mut written = [TS_FRAME_BEGIN, TS_FRAME_END, TS_SPLAT_END].to_vec();
+                if splat_begin_slot == TS_SPLAT_BEGIN {
+                    written.push(TS_SPLAT_BEGIN);
+                }
+                if let Some(slot) = prepass_begin_slot {
+                    written.push(slot);
+                    written.push(TS_PREPASS_END);
+                }
+                written.sort_unstable();
+                written.dedup();
+                for slot in written {
+                    let at = slot as u64 * TS_RESOLVE_STRIDE;
+                    enc.resolve_query_set(q, slot..slot + 1, resolve, at);
+                    enc.copy_buffer_to_buffer(resolve, at, &self.stats.buffer, slot as u64 * 8, 8);
+                }
             }
             enc.copy_buffer_to_buffer(&self.counters, 0, &self.stats.buffer, TS_COUNT as u64 * 8, 4);
             self.stats.state = ReadbackState::Copied;

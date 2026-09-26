@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -17,7 +17,7 @@ use transform_gizmo_egui::{
 use crate::camera::{Camera, CameraKeys};
 use crate::gpu::converter::{resolution_from_quality, ConversionStats, DetailSettings};
 use crate::gpu::pool::GpuPooler;
-use crate::merge::{MergeSettings, VolumeMergeSettings};
+use crate::merge::{MergeSettings, MergeStats, VolumeMergeSettings};
 use crate::gpu::renderer::OUTPUT_FORMAT;
 use crate::gpu::ao::{AoBaker, AoSettings};
 use crate::gpu::{
@@ -26,8 +26,8 @@ use crate::gpu::{
 };
 use crate::clump::ClumpSettings;
 use crate::hair::{Groom, StrandSplats, MAX_ROUNDNESS};
-use crate::ply::{self, LoadedPly};
-use crate::scene::{self, Scene};
+use crate::ply;
+use crate::scene;
 use crate::types::{BBox, PlyFormat, RenderMode, SourceFormat};
 
 pub fn run(file: Option<PathBuf>) -> Result<()> {
@@ -67,15 +67,83 @@ pub fn run(file: Option<PathBuf>) -> Result<()> {
 
 // ---------------------------------------------------------------------------
 
+/// Long GPU work runs on a worker thread so the window keeps responding. A
+/// job takes the tool it needs (converter, baker, pooler) and hands it back
+/// with its result; only one runs at a time.
+struct Job {
+    label: &'static str,
+    started: Instant,
+    /// `App::gaussians.generation` when the job started. A result built from
+    /// splats that were replaced meanwhile (another file was opened) is dropped.
+    base_generation: u64,
+    rx: flume::Receiver<JobDone>,
+}
+
+/// What a conversion was started for.
+enum ConvertOrigin {
+    /// A settings change or "Re-run conversion".
+    Settings,
+    /// A mesh the user opened.
+    Opened { name: String },
+    /// A batch item: written to `output` straight from the worker.
+    Batch {
+        index: usize,
+        output: PathBuf,
+        format: PlyFormat,
+        gaussian_std: f32,
+    },
+}
+
+// One per job, so the size difference between variants does not matter.
+#[allow(clippy::large_enum_variant)]
+enum JobDone {
+    Converted {
+        converter: Box<Converter>,
+        gaussians: GaussianBuffer,
+        stats: ConversionStats,
+        origin: ConvertOrigin,
+        /// Batch items only: the result of writing the file.
+        saved: Option<Result<(), String>>,
+    },
+    Baked {
+        baker: AoBaker,
+    },
+    Pooled {
+        pooler: GpuPooler,
+        buffer: wgpu::Buffer,
+        count: u32,
+        stats: MergeStats,
+    },
+    Saved(Result<PathBuf, String>),
+}
+
+/// Download `gaussians` and write them to `path`.
+fn write_splats(
+    ctx: &GpuContext,
+    gaussians: &GaussianBuffer,
+    path: &Path,
+    format: PlyFormat,
+    gaussian_std: f32,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let data = gaussians.download(ctx);
+    ply::write_ply(path, &data, format, gaussians.scale_multiplier(gaussian_std))
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// A file read (and uploaded to the GPU) on the loader thread.
 enum Loaded {
     Mesh {
         path: PathBuf,
-        scene: Scene,
+        scene: Arc<GpuScene>,
         batch: bool,
     },
     Ply {
         path: PathBuf,
-        ply: LoadedPly,
+        gaussians: GaussianBuffer,
+        has_pbr: bool,
     },
     Groom {
         path: PathBuf,
@@ -88,7 +156,15 @@ enum Loaded {
     },
 }
 
-fn spawn_load(path: PathBuf, batch: bool, tx: flume::Sender<Loaded>, egui_ctx: egui::Context) {
+/// Read `path` on a worker thread, uploading meshes and splats to the GPU
+/// there too (texture mip chains and large buffers take a while).
+fn spawn_load(
+    ctx: GpuContext,
+    path: PathBuf,
+    batch: bool,
+    tx: flume::Sender<Loaded>,
+    egui_ctx: egui::Context,
+) {
     std::thread::spawn(move || {
         let ext = path
             .extension()
@@ -111,7 +187,15 @@ fn spawn_load(path: PathBuf, batch: bool, tx: flume::Sender<Loaded>, egui_ctx: e
             }
         } else if ext == "ply" || ext == "spz" {
             match ply::load_gaussian_ply(&path) {
-                Ok(ply) => Loaded::Ply { path, ply },
+                Ok(ply) => {
+                    let mut gaussians = GaussianBuffer::new_empty(&ctx);
+                    gaussians.upload_ply(&ctx, &ply.gaussians, ply.has_pbr);
+                    Loaded::Ply {
+                        path,
+                        gaussians,
+                        has_pbr: ply.has_pbr,
+                    }
+                }
                 Err(e) => Loaded::Failed {
                     path,
                     error: format!("{e:#}"),
@@ -120,7 +204,11 @@ fn spawn_load(path: PathBuf, batch: bool, tx: flume::Sender<Loaded>, egui_ctx: e
             }
         } else {
             match scene::load_gltf(&path) {
-                Ok(scene) => Loaded::Mesh { path, scene, batch },
+                Ok(scene) => Loaded::Mesh {
+                    path,
+                    scene: Arc::new(GpuScene::upload(&ctx, &scene)),
+                    batch,
+                },
                 Err(e) => Loaded::Failed {
                     path,
                     error: format!("{e:#}"),
@@ -240,9 +328,14 @@ struct ClumpCache {
 pub struct App {
     ctx: GpuContext,
     renderer: Renderer,
-    converter: Converter,
+    /// `None` while a conversion job has it.
+    converter: Option<Box<Converter>>,
     gaussians: GaussianBuffer,
-    scene: Option<GpuScene>,
+    scene: Option<Arc<GpuScene>>,
+    /// Long GPU work in flight on a worker thread.
+    job: Option<Job>,
+    /// Set by the device-lost callback: why the GPU device was lost.
+    device_lost: Arc<Mutex<Option<String>>>,
     scene_bbox: BBox,
     loaded_path: Option<PathBuf>,
     output_texture: Option<(egui::TextureId, (u32, u32))>,
@@ -274,6 +367,8 @@ pub struct App {
     detail_enabled: bool,
     detail_strength: f32,
     needs_conversion: bool,
+    /// A freshly loaded mesh waiting for the running job to finish.
+    pending_conversion: Option<ConvertOrigin>,
     last_conversion: Option<ConversionStats>,
 
     // export
@@ -342,18 +437,31 @@ impl App {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("eframe was not started with the wgpu renderer"))?;
         let ctx = GpuContext::from_parts(&rs.adapter, rs.device.clone(), rs.queue.clone());
+        let info = &ctx.adapter_info;
         log::info!(
-            "GPU: {} ({:?})",
-            ctx.adapter_info.name,
-            ctx.adapter_info.backend
+            "GPU: {} ({:?}), driver: {} {}",
+            info.name,
+            info.backend,
+            info.driver,
+            info.driver_info
         );
+        // wgpu reports a lost device only through this callback; every later
+        // call just fails (egui then panics on its next frame). Record why.
+        let device_lost = Arc::new(Mutex::new(None));
+        let lost = device_lost.clone();
+        ctx.device.set_device_lost_callback(move |reason, message| {
+            log::error!("GPU device lost ({reason:?}): {message}");
+            *lost.lock().unwrap() = Some(format!("{reason:?}: {message}"));
+        });
         let (tx, rx) = flume::unbounded();
         let mut app = Self {
             renderer: Renderer::new(&ctx),
-            converter: Converter::new(&ctx),
+            converter: Some(Box::new(Converter::new(&ctx))),
             gaussians: GaussianBuffer::new_empty(&ctx),
             ctx,
             scene: None,
+            job: None,
+            device_lost,
             scene_bbox: BBox::EMPTY,
             loaded_path: None,
             output_texture: None,
@@ -378,6 +486,7 @@ impl App {
             detail_enabled: false,
             detail_strength: DetailSettings::DEFAULT_STRENGTH,
             needs_conversion: false,
+            pending_conversion: None,
             last_conversion: None,
             output_folder: String::new(),
             output_name: "output.ply".into(),
@@ -430,7 +539,168 @@ impl App {
     fn open(&mut self, path: PathBuf, egui_ctx: &egui::Context) {
         self.path_input = path.display().to_string();
         self.loading = Some(path.clone());
-        spawn_load(path, false, self.tx.clone(), egui_ctx.clone());
+        spawn_load(self.ctx.clone(), path, false, self.tx.clone(), egui_ctx.clone());
+    }
+
+    /// Run `work` on a worker thread. The caller checks `self.job.is_none()`.
+    fn spawn_job(
+        &mut self,
+        label: &'static str,
+        egui_ctx: &egui::Context,
+        work: impl FnOnce(&GpuContext) -> JobDone + Send + 'static,
+    ) {
+        debug_assert!(self.job.is_none());
+        let (tx, rx) = flume::bounded(1);
+        let ctx = self.ctx.clone();
+        let egui_ctx = egui_ctx.clone();
+        std::thread::Builder::new()
+            .name(format!("gpu job: {label}"))
+            .spawn(move || {
+                let _ = tx.send(work(&ctx));
+                egui_ctx.request_repaint();
+            })
+            .expect("cannot spawn a worker thread");
+        self.job = Some(Job {
+            label,
+            started: Instant::now(),
+            base_generation: self.gaussians.generation,
+            rx,
+        });
+    }
+
+    /// Collect a finished job, if any.
+    fn poll_job(&mut self) {
+        let Some(job) = &self.job else {
+            return;
+        };
+        let done = match job.rx.try_recv() {
+            Ok(done) => done,
+            Err(flume::TryRecvError::Empty) => return,
+            Err(flume::TryRecvError::Disconnected) => {
+                // The worker panicked; its tool went with it and is rebuilt on next use.
+                let label = job.label;
+                self.job = None;
+                if let Some(i) = self.batch_current.take() {
+                    self.batch[i].status = BatchStatus::Failed(format!("{label} crashed"));
+                }
+                self.set_status(format!("{label} failed (see the log)"), true);
+                return;
+            }
+        };
+        let job = self.job.take().unwrap();
+        let ms = job.started.elapsed().as_secs_f64() * 1e3;
+        // Splats replaced while the job ran (a file was opened): drop the result.
+        let current = self.gaussians.generation == job.base_generation;
+        match done {
+            JobDone::Converted {
+                converter,
+                gaussians,
+                stats,
+                origin,
+                saved,
+            } => {
+                self.converter = Some(converter);
+                if current {
+                    self.gaussians = gaussians;
+                }
+                if stats.fragments > stats.capacity {
+                    self.set_status(
+                        format!(
+                            "{} splats dropped: GPU buffer limit reached",
+                            stats.fragments - stats.capacity
+                        ),
+                        true,
+                    );
+                } else if let ConvertOrigin::Opened { name } = &origin {
+                    if current {
+                        self.set_status(
+                            format!(
+                                "Converted {name} ({} triangles) into {} gaussians in {ms:.0} ms",
+                                fmt_thousands(
+                                    self.scene.as_ref().map_or(0, |s| s.triangle_count) as u64
+                                ),
+                                fmt_thousands(stats.gaussians as u64),
+                            ),
+                            false,
+                        );
+                    }
+                }
+                self.last_conversion = Some(stats);
+                if let ConvertOrigin::Batch { index, .. } = origin {
+                    self.batch[index].status = match saved {
+                        Some(Ok(())) => BatchStatus::Done,
+                        Some(Err(e)) => BatchStatus::Failed(e),
+                        None => BatchStatus::Failed("not written".into()),
+                    };
+                    self.batch_current = None;
+                }
+            }
+            JobDone::Baked { baker } => {
+                self.ao_baker = Some(baker);
+                if current {
+                    self.ao_generation = Some(job.base_generation);
+                    self.set_status(
+                        format!(
+                            "Baked occlusion for {} splats in {ms:.0} ms",
+                            fmt_thousands(self.gaussians.count as u64)
+                        ),
+                        false,
+                    );
+                }
+            }
+            JobDone::Pooled {
+                pooler,
+                buffer,
+                count,
+                stats,
+            } => {
+                self.pooler = Some(pooler);
+                if current {
+                    self.gaussians.buffer = buffer;
+                    self.gaussians.count = count;
+                    self.gaussians.capacity = count.max(1);
+                    self.gaussians.generation += 1;
+                    self.ao_generation = Some(self.gaussians.generation);
+                    self.set_status(
+                        format!(
+                            "Pooled buried splats: {} -> {} ({:.1}x fewer) in {ms:.0} ms",
+                            fmt_thousands(stats.input as u64),
+                            fmt_thousands(stats.output as u64),
+                            stats.input as f64 / stats.output.max(1) as f64,
+                        ),
+                        false,
+                    );
+                }
+            }
+            JobDone::Saved(Ok(p)) => self.set_status(format!("Saved {}", p.display()), false),
+            JobDone::Saved(Err(e)) => self.set_status(format!("Save failed: {e}"), true),
+        }
+    }
+
+    /// If the GPU device was lost, say why and quit: egui shares the device,
+    /// so the window cannot draw another frame, and it would panic trying.
+    fn exit_if_device_lost(&self) {
+        let Some(reason) = self.device_lost.lock().unwrap().take() else {
+            return;
+        };
+        let doing = self
+            .job
+            .as_ref()
+            .map_or("rendering".to_string(), |j| format!("{} ({:.1} s in)", j.label, j.started.elapsed().as_secs_f32()));
+        let text = format!(
+            "The GPU device was lost while {doing}.\n\n{reason}\n\n\
+             On Windows this usually means one GPU job ran past the driver's \
+             2-second timeout (TDR), or the driver reset. Try a lower sampling \
+             density or a smaller model, or another backend \
+             (set WGPU_BACKEND=dx12 or vulkan). Mesh2Splat has to close."
+        );
+        log::error!("{text}");
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("Mesh2Splat: GPU device lost")
+            .set_description(&text)
+            .show();
+        std::process::exit(1);
     }
 
     /// Rebuild the strand splats after a groom setting changed.
@@ -484,62 +754,74 @@ impl App {
         }
     }
 
-    fn run_conversion(&mut self) {
-        if let Some(scene) = &self.scene {
-            let stats = self.converter.convert(
-                &self.ctx,
-                scene,
-                self.convert_settings(),
-                &mut self.gaussians,
-            );
-            if stats.fragments > stats.capacity {
-                self.set_status(
-                    format!(
-                        "{} splats dropped: GPU buffer limit reached",
-                        stats.fragments - stats.capacity
-                    ),
-                    true,
-                );
-            }
-            self.last_conversion = Some(stats);
-        }
+    /// Convert the loaded scene on a worker thread; the old splats stay on
+    /// screen until the new ones are in.
+    fn start_conversion(&mut self, origin: ConvertOrigin, egui_ctx: &egui::Context) {
         self.needs_conversion = false;
+        let Some(scene) = self.scene.clone() else {
+            return;
+        };
+        let converter = self.converter.take();
+        let settings = self.convert_settings();
+        let mut target = GaussianBuffer::new_empty(&self.ctx);
+        // `convert` bumps it past the splats on screen.
+        target.generation = self.gaussians.generation;
+        self.spawn_job("converting", egui_ctx, move |ctx| {
+            let mut converter = converter.unwrap_or_else(|| Box::new(Converter::new(ctx)));
+            let stats = converter.convert(ctx, &scene, settings, &mut target);
+            let saved = match &origin {
+                ConvertOrigin::Batch {
+                    output,
+                    format,
+                    gaussian_std,
+                    ..
+                } => Some(write_splats(ctx, &target, output, *format, *gaussian_std)),
+                _ => None,
+            };
+            JobDone::Converted {
+                converter,
+                gaussians: target,
+                stats,
+                origin,
+                saved,
+            }
+        });
     }
 
     fn handle_loaded(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Loaded::Mesh { path, scene, batch } => {
-                    let gpu = GpuScene::upload(&self.ctx, &scene);
                     self.scene_bbox = scene.bbox;
-                    self.scene = Some(gpu);
+                    self.scene = Some(scene);
                     self.settings.model_transform = Mat4::IDENTITY;
-                    self.run_conversion();
-                    if batch {
-                        self.finish_batch_item(None);
-                    } else {
-                        self.loading = None;
-                        self.camera.frame_bbox(&self.scene_bbox);
-                        self.place_light_default();
-                        if let Some(stem) = path.file_stem() {
-                            self.output_name = format!("{}.ply", stem.to_string_lossy());
+                    let origin = match self.batch_current.filter(|_| batch) {
+                        Some(index) => ConvertOrigin::Batch {
+                            index,
+                            output: self.batch[index].output.with_extension(self.format.extension()),
+                            format: self.format,
+                            gaussian_std: self.settings.gaussian_std,
+                        },
+                        None => {
+                            self.loading = None;
+                            self.camera.frame_bbox(&self.scene_bbox);
+                            self.place_light_default();
+                            if let Some(stem) = path.file_stem() {
+                                self.output_name = format!("{}.ply", stem.to_string_lossy());
+                            }
+                            ConvertOrigin::Opened {
+                                name: path.file_name().unwrap_or_default().to_string_lossy().into(),
+                            }
                         }
-                        self.set_status(
-                            format!(
-                                "Converted {} ({} meshes, {} triangles) into {} gaussians",
-                                path.file_name().unwrap_or_default().to_string_lossy(),
-                                scene.meshes.len(),
-                                scene.triangle_count(),
-                                self.gaussians.count
-                            ),
-                            false,
-                        );
-                    }
+                    };
+                    // Started from `ui` as soon as no other job is running.
+                    self.pending_conversion = Some(origin);
                     self.loaded_path = Some(path);
                 }
                 Loaded::Groom { path, groom } => {
                     self.loading = None;
                     self.scene = None;
+                    self.pending_conversion = None;
                     self.settings.model_transform = Mat4::IDENTITY;
                     self.settings.depth_test = false;
                     let strands = groom.strands.len();
@@ -567,18 +849,21 @@ impl App {
                     );
                     self.loaded_path = Some(path);
                 }
-                Loaded::Ply { path, ply } => {
+                Loaded::Ply {
+                    path,
+                    mut gaussians,
+                    has_pbr,
+                } => {
                     self.loading = None;
                     self.scene = None;
+                    self.pending_conversion = None;
                     self.settings.model_transform = Mat4::IDENTITY;
                     self.settings.depth_test = false;
-                    let mut bbox = BBox::EMPTY;
-                    for g in &ply.gaussians {
-                        bbox.grow(Vec3::from_slice(&g.position[..3]));
-                    }
+                    let bbox = gaussians.bounds;
                     self.scene_bbox = bbox;
-                    self.gaussians
-                        .upload_ply(&self.ctx, &ply.gaussians, ply.has_pbr);
+                    gaussians.generation = self.gaussians.generation + 1;
+                    let count = gaussians.count;
+                    self.gaussians = gaussians;
                     if let Some(stem) = path.file_stem() {
                         // Never default to overwriting the file that was just opened.
                         self.output_name = format!("{}_export.ply", stem.to_string_lossy());
@@ -588,9 +873,9 @@ impl App {
                     self.set_status(
                         format!(
                             "Loaded {} gaussians from {} (PBR: {})",
-                            ply.gaussians.len(),
+                            count,
                             path.display(),
-                            ply.has_pbr
+                            has_pbr
                         ),
                         false,
                     );
@@ -598,7 +883,9 @@ impl App {
                 }
                 Loaded::Failed { path, error, batch } => {
                     if batch {
-                        self.finish_batch_item(Some(error));
+                        if let Some(i) = self.batch_current.take() {
+                            self.batch[i].status = BatchStatus::Failed(error);
+                        }
                     } else {
                         self.loading = None;
                         self.set_status(
@@ -642,24 +929,16 @@ impl App {
         folder.join(name)
     }
 
-    fn save(&mut self, path: PathBuf) {
+    fn save(&mut self, path: PathBuf, egui_ctx: &egui::Context) {
         if self.gaussians.count == 0 {
             self.set_status("Nothing to save", true);
             return;
         }
-        let data = self.gaussians.download(&self.ctx);
-        let mult = self.gaussians.scale_multiplier(self.settings.gaussian_std);
-        let format = self.format;
-        // The file is written on a worker thread, as in the original.
-        let (tx, rx) = flume::bounded(1);
-        std::thread::spawn(move || {
-            let _ = tx.send(ply::write_ply(&path, &data, format, mult).map(|_| path));
+        let gaussians = self.gaussians.clone();
+        let (format, std) = (self.format, self.settings.gaussian_std);
+        self.spawn_job("saving", egui_ctx, move |ctx| {
+            JobDone::Saved(write_splats(ctx, &gaussians, &path, format, std).map(|_| path))
         });
-        match rx.recv() {
-            Ok(Ok(p)) => self.set_status(format!("Saved {}", p.display()), false),
-            Ok(Err(e)) => self.set_status(format!("Save failed: {e:#}"), true),
-            Err(_) => self.set_status("Save thread crashed", true),
-        }
     }
 
     // --- batch ---------------------------------------------------------------
@@ -717,6 +996,7 @@ impl App {
                 self.batch[i].status = BatchStatus::Processing;
                 self.batch_current = Some(i);
                 spawn_load(
+                    self.ctx.clone(),
                     self.batch[i].path.clone(),
                     true,
                     self.tx.clone(),
@@ -736,32 +1016,6 @@ impl App {
                 );
             }
         }
-    }
-
-    fn finish_batch_item(&mut self, error: Option<String>) {
-        let Some(i) = self.batch_current.take() else {
-            return;
-        };
-        let status = match error {
-            Some(e) => BatchStatus::Failed(e),
-            None => {
-                let data = self.gaussians.download(&self.ctx);
-                let out = self.batch[i].output.with_extension(self.format.extension());
-                if let Some(p) = out.parent() {
-                    let _ = std::fs::create_dir_all(p);
-                }
-                match ply::write_ply(
-                    &out,
-                    &data,
-                    self.format,
-                    self.gaussians.scale_multiplier(self.settings.gaussian_std),
-                ) {
-                    Ok(()) => BatchStatus::Done,
-                    Err(e) => BatchStatus::Failed(format!("{e:#}")),
-                }
-            }
-        };
-        self.batch[i].status = status;
     }
 
     // --- UI -----------------------------------------------------------------
@@ -788,6 +1042,12 @@ impl App {
                         self.open(PathBuf::from(self.path_input.trim()), &egui_ctx);
                     }
                 });
+                if let Some(job) = &self.job {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("{} ({:.1} s)", job.label, job.started.elapsed().as_secs_f32()));
+                    });
+                }
                 if let Some(p) = &self.loading {
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -818,9 +1078,9 @@ impl App {
                     }
                 });
                 let save = egui::Button::new("Save splat").fill(Color32::from_rgb(51, 153, 51));
-                if ui.add_enabled(self.gaussians.count > 0, save).clicked() {
+                if ui.add_enabled(self.gaussians.count > 0 && self.job.is_none(), save).clicked() {
                     let p = self.output_path();
-                    self.save(p);
+                    self.save(p, &egui_ctx);
                 }
             });
 
@@ -915,8 +1175,8 @@ impl App {
                     ui.checkbox(&mut self.settings.hair_shading, "Anisotropic (hair) shading")
                         .on_hover_text("Kajiya-Kay: shade along each splat's longest axis instead of its normal. For hair, fur and other fibres, where the splats are long and thin.");
                     ui.horizontal(|ui| {
-                        if ui.button("Bake occlusion").on_hover_text("Walk the splats once and record, per splat, how buried it is and which way is open. Stored in spare channels, so it costs nothing to render.").clicked() {
-                            self.bake_occlusion();
+                        if ui.add_enabled(self.job.is_none(), egui::Button::new("Bake occlusion")).on_hover_text("Walk the splats once and record, per splat, how buried it is and which way is open. Stored in spare channels, so it costs nothing to render.").clicked() {
+                            self.bake_occlusion(&egui_ctx);
                         }
                         let stale = self.ao_generation != Some(self.gaussians.generation);
                         ui.label(match (self.ao_generation.is_some(), stale) {
@@ -926,8 +1186,8 @@ impl App {
                         });
                     });
                     ui.horizontal(|ui| {
-                        if ui.button("Merge buried splats").on_hover_text("Splats the bake found buried contribute bulk opacity but no silhouette: pool them into coarse splats that fill the same volume and stop the same amount of light. The visible shell keeps its detail.").clicked() {
-                            self.merge_occluded_splats();
+                        if ui.add_enabled(self.job.is_none(), egui::Button::new("Merge buried splats")).on_hover_text("Splats the bake found buried contribute bulk opacity but no silhouette: pool them into coarse splats that fill the same volume and stop the same amount of light. The visible shell keeps its detail.").clicked() {
+                            self.merge_occluded_splats(&egui_ctx);
                         }
                         ui.add(egui::Slider::new(&mut self.volume_merge.relative_openness, 0.0..=1.0).text("interior below")).on_hover_text("How buried a splat has to be, measured against this groom's own most open splats, before it is pooled. Relative rather than absolute: a dense groom buries even its own silhouette, so a fixed threshold would pool the whole of it and the groom would stop looking like itself.");
                     });
@@ -1050,55 +1310,43 @@ impl App {
     }
 
     /// Bake occlusion and a bent normal into the splats' spare channels.
-    fn bake_occlusion(&mut self) {
+    fn bake_occlusion(&mut self, egui_ctx: &egui::Context) {
         if self.gaussians.count == 0 {
             return;
         }
         let bounds = self.model_bbox();
-        let start = Instant::now();
-        let baker = self
-            .ao_baker
-            .get_or_insert_with(|| AoBaker::new(&self.ctx));
-        baker.bake(&self.ctx, &self.gaussians, &bounds, &self.ao_settings);
-        self.ctx.wait_idle();
-        self.ao_generation = Some(self.gaussians.generation);
-        self.set_status(
-            format!(
-                "Baked occlusion for {} splats in {:.0} ms",
-                fmt_thousands(self.gaussians.count as u64),
-                start.elapsed().as_secs_f64() * 1e3
-            ),
-            false,
-        );
+        let gaussians = self.gaussians.clone();
+        let baker = self.ao_baker.take();
+        let settings = self.ao_settings;
+        self.spawn_job("baking occlusion", egui_ctx, move |ctx| {
+            let mut baker = baker.unwrap_or_else(|| AoBaker::new(ctx));
+            baker.bake(ctx, &gaussians, &bounds, &settings);
+            ctx.wait_idle();
+            JobDone::Baked { baker }
+        });
     }
 
     /// Pool the splats the bake found buried into coarse volume-filling ones.
-    fn merge_occluded_splats(&mut self) {
+    fn merge_occluded_splats(&mut self, egui_ctx: &egui::Context) {
         if self.ao_generation != Some(self.gaussians.generation) {
             self.set_status("Bake occlusion first: the merge needs it", true);
             return;
         }
-        let start = Instant::now();
         let bounds = self.model_bbox();
-        let pooler = self.pooler.get_or_insert_with(|| GpuPooler::new(&self.ctx));
-        let (buffer, count, stats) =
-            pooler.run(&self.ctx, &self.gaussians, &bounds, &self.volume_merge);
-        self.ctx.wait_idle();
-        self.gaussians.buffer = buffer;
-        self.gaussians.count = count;
-        self.gaussians.capacity = count.max(1);
-        self.gaussians.generation += 1;
-        self.ao_generation = Some(self.gaussians.generation);
-        self.set_status(
-            format!(
-                "Pooled buried splats: {} -> {} ({:.1}x fewer) in {:.0} ms",
-                fmt_thousands(stats.input as u64),
-                fmt_thousands(stats.output as u64),
-                stats.input as f64 / stats.output.max(1) as f64,
-                start.elapsed().as_secs_f64() * 1e3
-            ),
-            false,
-        );
+        let gaussians = self.gaussians.clone();
+        let pooler = self.pooler.take();
+        let settings = self.volume_merge;
+        self.spawn_job("pooling buried splats", egui_ctx, move |ctx| {
+            let mut pooler = pooler.unwrap_or_else(|| GpuPooler::new(ctx));
+            let (buffer, count, stats) = pooler.run(ctx, &gaussians, &bounds, &settings);
+            ctx.wait_idle();
+            JobDone::Pooled {
+                pooler,
+                buffer,
+                count,
+                stats,
+            }
+        });
     }
 
     /// Strand settings; each rebuilds the splats from the loaded groom.
@@ -1290,10 +1538,9 @@ impl App {
                 st.prepass, st.sort, st.splat
             ));
         }
-        ui.small(format!(
-            "{} ({:?})",
-            self.ctx.adapter_info.name, self.ctx.adapter_info.backend
-        ));
+        let info = &self.ctx.adapter_info;
+        ui.small(format!("{} ({:?})", info.name, info.backend));
+        ui.small(format!("Driver: {} {}", info.driver, info.driver_info));
 
         // Frame-time plot
         let (rect, _) =
@@ -1537,7 +1784,7 @@ impl App {
                 &self.camera,
                 &self.settings,
                 &self.gaussians,
-                self.scene.as_ref(),
+                self.scene.as_deref(),
                 size,
             );
             self.ctx.queue.submit([enc.finish()]);
@@ -1695,7 +1942,11 @@ impl App {
                 use egui::Key::*;
                 [W, A, S, D, Q, E, R, T].iter().any(|k| i.key_down(*k))
             });
-        let busy = self.loading.is_some() || self.batch_running || self.needs_conversion;
+        let busy = self.loading.is_some()
+            || self.batch_running
+            || self.needs_conversion
+            || self.job.is_some()
+            || self.pending_conversion.is_some();
         if self.continuous_redraw || busy || fly_keys_held || self.settle_frames > 0 {
             self.settle_frames = self.settle_frames.saturating_sub(1);
             ctx.request_repaint();
@@ -1771,10 +2022,16 @@ fn fmt_thousands(v: u64) -> String {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let egui_ctx = ui.ctx().clone();
+        self.exit_if_device_lost();
+        self.poll_job();
         self.handle_loaded();
         self.pump_batch(&egui_ctx);
-        if self.needs_conversion && !self.batch_running {
-            self.run_conversion();
+        if self.job.is_none() {
+            if let Some(origin) = self.pending_conversion.take() {
+                self.start_conversion(origin, &egui_ctx);
+            } else if self.needs_conversion && !self.batch_running {
+                self.start_conversion(ConvertOrigin::Settings, &egui_ctx);
+            }
         }
 
         // Drag and drop
@@ -1802,5 +2059,8 @@ impl eframe::App for App {
             .frame(egui::Frame::NONE)
             .show_inside(ui, |ui| self.viewport(ui, frame));
         self.schedule_repaint(&egui_ctx);
+        // The frame just submitted may have lost the device: quit before egui
+        // paints with it.
+        self.exit_if_device_lost();
     }
 }

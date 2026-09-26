@@ -139,6 +139,8 @@ impl GpuContext {
 }
 
 /// GPU-resident gaussians plus the metadata needed to interpret them.
+/// Cloning shares the GPU buffer (a handle), so a worker thread can read it.
+#[derive(Clone)]
 pub struct GaussianBuffer {
     pub buffer: wgpu::Buffer,
     /// Capacity in gaussians.

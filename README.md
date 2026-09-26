@@ -169,6 +169,14 @@ Clumps at their measured width fill the volume and blend into each other; a
 **Width ×** below 1 separates them into distinct clumps, a more stylised look.
 Finding 200-5000 clumps in 50 k strands takes about half a second.
 
+The grooms are not in the repository (they are free for personal and research
+use only); fetch them into `assets/` first:
+
+```bash
+scripts/fetch_grooms.sh                                               # Linux / macOS
+powershell -ExecutionPolicy Bypass -File scripts\fetch_grooms.ps1     # Windows
+```
+
 Open a `.hair` groom in the viewer like any other file (**Input**, or drag and
 drop). It loads as strand-aligned splats, turns on hair shading and opacity
 shadows, and a **Groom** section appears with the strand count, splats per
